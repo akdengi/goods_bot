@@ -2347,13 +2347,7 @@ async def cmd_orders(update, context):
     except OzonError as e:
         await update.message.reply_text('Ошибка Ozon: ' + str(e), reply_markup=inline_main_kb())
         return
-        await update.message.reply_text('Ошибка Ozon: ' + str(e), reply_markup=inline_main_kb())
-        return
-
-    await update.message.reply_text("\n".join(lines), reply_markup=inline_main_kb())
-    if not posts:
         await update.message.reply_text('Заказов за ' + str(days) + ' дней не найдено.', reply_markup=inline_main_kb())
-        return
     posts = sorted(posts, key=lambda p: p.get('created_at') or p.get('in_process_at') or '', reverse=True)
     lines = ['Заказы Ozon за ' + str(days) + ' дней (' + str(len(posts)) + '):']
     for p in posts[:20]:
