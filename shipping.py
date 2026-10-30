@@ -706,6 +706,8 @@ def build_shipping_service(
     cdek_v1_url: str = "https://integration.cdek.ru",
     cdek_v2_url: str = "https://api.cdek.ru",
     cdek_storage_days: int = 7,
+    yandex_market_token: str = "",
+    yandex_market_campaign_id: Optional[int] = None,
 ) -> ShippingService:
     return ShippingService(
         [
@@ -718,6 +720,7 @@ def build_shipping_service(
                 v2_url=cdek_v2_url,
                 storage_days=cdek_storage_days,
             ),
+            YandexMarketDeliveryProvider(token=yandex_market_token, campaign_id=yandex_market_campaign_id),
         ]
     )
 
@@ -1072,6 +1075,284 @@ class YandexDeliveryProvider(DeliveryProvider):
                     is_delivered=delivered,
                     is_cancelled=cancelled,
                     extra={"yandex_api": "express", "raw_status": status_raw},
+                )
+            )
+        return result[:limit]
+YANDEX_MARKET_STATUS_LABELS = {
+    "PLACING": "Оформляется",
+    "RESERVED": "Зарезервирован",
+    "UNPAID": "Ожидает оплаты",
+    "PROCESSING": "В обработке",
+    "DELIVERY": "Передан в доставку",
+    "PICKUP": "Доставлен в ПВЗ",
+    "DELIVERED": "Доставлен",
+    "CANCELLED": "Отменён",
+    "PARTIALLY_RETURNED": "Частично возвращён",
+    "RETURNED": "Возвращён",
+    "PENDING": "Ожидает обработки",
+    "UNKNOWN": "Неизвестный статус",
+}
+
+
+class YandexMarketDeliveryProvider(DeliveryProvider):
+    key = "yandex_market"
+    title = "Яндекс Маркет"
+    emoji = "🟡"
+
+    def __init__(self, token: str, campaign_id: Optional[int] = None):
+        self.token = (token or "").strip()
+        self.campaign_id = int(campaign_id) if campaign_id else None
+        self._business_campaigns: Optional[List[Dict[str, Any]]] = None
+        self.storage_days = 7
+        try:
+            self.storage_days = max(1, int(os.getenv("YANDEX_MARKET_STORAGE_DAYS", "7") or 7))
+        except (TypeError, ValueError):
+            self.storage_days = 7
+
+    def configured(self) -> bool:
+        return bool(self.token)
+
+    def _auth_headers(self) -> Dict[str, str]:
+        return {"Api-Key": self.token, "Content-Type": "application/json"}
+
+    async def _ensure_campaign(self, client: httpx.AsyncClient) -> int:
+        if self.campaign_id is not None:
+            return int(self.campaign_id)
+        if self._business_campaigns is None:
+            resp = await client.get("https://api.partner.market.yandex.ru/v2/campaigns", headers=self._auth_headers())
+            if resp.status_code >= 400:
+                raise ShippingError(f"Яндекс Маркет: не удалось получить кампании: {resp.text[:300]}")
+            data = resp.json()
+            campaigns = data.get("campaigns", [])
+            if not isinstance(campaigns, list):
+                campaigns = []
+            self._business_campaigns = campaigns
+        for campaign in self._business_campaigns or []:
+            if isinstance(campaign, dict) and campaign.get("id") is not None:
+                self.campaign_id = int(campaign.get("id"))
+                return self.campaign_id
+        raise ShippingError("Яндекс Маркет: не найден campaignId")
+
+    @staticmethod
+    def _parse_ym_dt(value: Any, time_value: Optional[str] = None) -> Optional[datetime]:
+        if value is None:
+            return None
+        s = str(value).strip()
+        if not s:
+            return None
+        # Numeric Unix timestamp.
+        try:
+            ts = int(s)
+            if ts > 1000000000:
+                return datetime.fromtimestamp(ts, timezone.utc)
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M:%S", "%Y-%m-%d", "%d-%m-%Y"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except ValueError:
+                continue
+        dt = parse_dt(s)
+        if dt is None:
+            return None
+        if time_value:
+            tm = str(time_value).strip()
+            for fmt in ("%H:%M:%S", "%H:%M"):
+                try:
+                    parsed = datetime.strptime(tm, fmt)
+                    return dt.replace(hour=parsed.hour, minute=parsed.minute, second=parsed.second, tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+        return dt
+
+    @staticmethod
+    def _flatten_address(delivery: Dict[str, Any]) -> str:
+        addr = delivery.get("address", {}) if isinstance(delivery.get("address"), dict) else {}
+        region = delivery.get("region", {}) if isinstance(delivery.get("region"), dict) else {}
+        parts = [
+            region.get("name"),
+            addr.get("city") or region.get("name"),
+            addr.get("street"),
+            addr.get("house"),
+            addr.get("building"),
+            addr.get("entrance"),
+            addr.get("floor"),
+            addr.get("apartment"),
+        ]
+        clean = [str(x) for x in parts if x is not None and str(x).strip()]
+        return ", ".join(clean) if clean else str(addr.get("region") or "")
+
+    @staticmethod
+    def _order_items(products: Optional[List[Dict[str, Any]]], fallback_items: Optional[List[Dict[str, Any]]]) -> Optional[str]:
+        items = products if isinstance(products, list) else (fallback_items if isinstance(fallback_items, list) else [])
+        names: List[str] = []
+        qty = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                qty += int(item.get("count") or 0)
+            except (TypeError, ValueError):
+                qty += 1
+            title = item.get("offerName") or item.get("offer") or item.get("name") or item.get("offerId")
+            if title and str(title) not in names:
+                names.append(str(title))
+        product = " / ".join(names[:2]) + ("…" if len(names) > 2 else "") if names else None
+        return product
+
+    async def fetch(self, since: datetime, to: datetime, limit: int = 200) -> List[Shipment]:
+        if not self.configured():
+            raise ShippingError("Яндекс Маркет не настроен: заполните YANDEX_MARKET_API_KEY")
+        headers = self._auth_headers()
+        orders: List[Dict[str, Any]] = []
+        page_token: Optional[str] = None
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                cid = await self._ensure_campaign(client)
+                # fetch enough orders; prefer recently updated orders in the window.
+                request_params = {
+                    "limit": min(50, max(1, int(limit or 100))),
+                    "updatedAtFrom": (since.replace(tzinfo=timezone.utc) if since.tzinfo is None else since).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                    "updatedAtTo": (to.replace(tzinfo=timezone.utc) if to.tzinfo is None else to).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                }
+                while len(orders) < max(1, int(limit or 100)):
+                    params = dict(request_params)
+                    if page_token:
+                        params["pageToken"] = page_token
+                    else:
+                        params["page"] = 1 if not any(k in params for k in ("offset",)) else None
+                    params = {k: v for k, v in params.items() if v is not None}
+                    resp = await client.get(
+                        f"https://api.partner.market.yandex.ru/v2/campaigns/{cid}/orders",
+                        headers=headers,
+                        params=params,
+                    )
+                    if resp.status_code >= 400:
+                        raise ShippingError(f"Яндекс Маркет: HTTP {resp.status_code}: {resp.text[:300]}")
+                    data = resp.json()
+                    batch = data.get("orders")
+                    if not isinstance(batch, list):
+                        break
+                    orders.extend(row for row in batch if isinstance(row, dict))
+                    paging = data.get("paging") if isinstance(data.get("paging"), dict) else {}
+                    page_token = paging.get("nextPageToken")
+                    if not page_token or not batch:
+                        break
+                    if len(orders) >= max(1, int(limit)):
+                        break
+        except httpx.HTTPError as e:
+            raise ShippingError(f"Яндекс Маркет: сетевая ошибка: {e}") from e
+
+        result: List[Shipment] = []
+        for order in orders[: max(1, min(int(limit), 200))]:
+            if not isinstance(order, dict):
+                continue
+            status_raw = str(order.get("status") or "").upper()
+            status = YANDEX_MARKET_STATUS_LABELS.get(status_raw, status_raw or "—")
+            delivered = status_raw in ("DELIVERED", "PICKED", "DELIVERED_USER_NOT_RECEIVED", "DELIVERED_USER_RECEIVED")
+            cancelled = status_raw == "CANCELLED" or status_raw.startswith("RETURN")
+            pickup_ready = status_raw in ("PICKUP", "READY_FOR_PICKUP")
+            source_status = str(order.get("substatus") or status_raw)
+            tracking_codes = []
+            delivery = order.get("delivery") if isinstance(order.get("delivery"), dict) else {}
+            for track in delivery.get("tracks", []) if isinstance(delivery.get("tracks"), list) else []:
+                if isinstance(track, dict) and track.get("trackCode"):
+                    tracking_codes.append(str(track.get("trackCode")))
+            for shipment in delivery.get("shipments", []) if isinstance(delivery.get("shipments"), list) else []:
+                if isinstance(shipment, dict):
+                    for track in shipment.get("tracks", []) if isinstance(shipment.get("tracks"), list) else []:
+                        if isinstance(track, dict) and track.get("trackCode"):
+                            tracking_codes.append(str(track.get("trackCode")))
+            destination = delivery.get("address", {}).get("recipient") if isinstance(delivery.get("address"), dict) else None
+            region = delivery.get("region", {}) if isinstance(delivery.get("region"), dict) else {}
+            if not destination:
+                destination = " ".join(filter(None, [
+                    region.get("name"),
+                    delivery.get("address", {}).get("city"),
+                    delivery.get("address", {}).get("street"),
+                    delivery.get("address", {}).get("house"),
+                ]))
+            delivery_dates = delivery.get("dates") if isinstance(delivery.get("dates"), dict) else {}
+            expected_at = self._parse_ym_dt(delivery_dates.get("toDate"), delivery_dates.get("toTime"))
+            if expected_at is None:
+                expected_at = self._parse_ym_dt(delivery_dates.get("fromDate"), delivery_dates.get("fromTime"))
+            if status_raw == "DELIVERED":
+                delivered_at = delivery_dates.get("realDeliveryDate") or order.get("updatedAt") or order.get("creationDate")
+            else:
+                delivered_at = order.get("updatedAt") if status_raw in ("DELIVERED", "PICKUP") else None
+            pickup_ready_at = None
+            delivered_at_parsed = None
+            if status_raw == "DELIVERED":
+                delivered_at_parsed = self._parse_ym_dt(delivered_at)
+            if pickup_ready:
+                status_ts = order.get("updatedAt") or order.get("creationDate")
+                pickup_ready_at = self._parse_ym_dt(status_ts)
+            storage_expires_at = None
+            if pickup_ready:
+                storage_candidate = self._parse_ym_dt(delivery.get("outletStorageLimitDate"))
+                if storage_candidate is None:
+                    storage_candidate = self._parse_ym_dt(delivery_dates.get("toDate"))
+                if storage_candidate is not None:
+                    from datetime import timedelta
+                    storage_expires_at = storage_candidate.isoformat()
+                if storage_expires_at is None and pickup_ready_at is not None:
+                    from datetime import timedelta
+                    storage_expires_at = (pickup_ready_at + timedelta(days=self.storage_days)).isoformat()
+            if status_raw == "DELIVERED" and delivered_at_parsed is not None:
+                delivered_at = delivered_at_parsed.isoformat()
+            elif delivered_at is not None:
+                try:
+                    delivered_at = self._parse_ym_dt(delivered_at).isoformat() if self._parse_ym_dt(delivered_at) else None
+                except Exception:
+                    delivered_at = None
+            if status_raw == "PICKUP" and pickup_ready_at is None:
+                pickup_ready_at = self._parse_ym_dt(order.get("updatedAt") or order.get("creationDate"))
+            status_time = order.get("updatedAt") or order.get("creationDate")
+            items = order.get("items", []) if isinstance(order.get("items"), list) else []
+            product = self._order_items(order.get("items"), order.get("items"))
+            qty = None
+            try:
+                qty = sum(int(item.get("count", 0)) for item in items if isinstance(item, dict))
+            except (TypeError, ValueError):
+                qty = len(items) or None
+            tracking = ", ".join(dict.fromkeys(tracking_codes))
+            destination_text = destination or f"Получатель / buyer"
+            extra = {
+                "yandex_market_api": "orders",
+                "raw_status": status_raw,
+                "ym_order_id": order.get("id"),
+                "ym_external_order_id": order.get("externalOrderId"),
+                "ym_buyer": order.get("buyer"),
+                "ym_delivery_window": f"{self._parse_ym_dt(delivery_dates.get('fromDate'), delivery_dates.get('fromTime'))}–{self._parse_ym_dt(delivery_dates.get('toDate'), delivery_dates.get('toTime'))}" if delivery_dates.get("fromDate") or delivery_dates.get("toDate") else None,
+                "ym_courier": delivery.get("courier"),
+                "ym_tracking": tracking,
+                "extra_provider": "yandex_market",
+                "recipient": delivery.get("address", {}).get("recipient"),
+                "status_time": status_time,
+                "storage_estimated": bool(pickup_ready and not delivery.get("outletStorageLimitDate")),
+            }
+            result.append(
+                Shipment(
+                    provider=self.key,
+                    shipment_id=str(order.get("id") or order.get("externalOrderId") or "—"),
+                    status=status,
+                    created_at=self._parse_ym_dt(order.get("creationDate")).isoformat() if self._parse_ym_dt(order.get("creationDate")) else None,
+                    expected_at=expected_at.isoformat() if expected_at else None,
+                    delivered_at=delivered_at,
+                    pickup_ready_at=pickup_ready_at.isoformat() if pickup_ready_at else None,
+                    storage_expires_at=storage_expires_at,
+                    product=product,
+                    quantity=qty or None,
+                    destination=destination_text,
+                    pickup_point=delivery.get("outletCode") or (pickup_ready_at is not None and destination_text) or None,
+                    tracking=tracking,
+                    status_code=status_raw or None,
+                    is_delivered=delivered,
+                    is_cancelled=cancelled,
+                    extra=extra,
                 )
             )
         return result[:limit]

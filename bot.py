@@ -23,6 +23,8 @@ load_dotenv(BASE_DIR / ".env")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID", "").strip()
 OZON_API_KEY = os.getenv("OZON_API_KEY", "").strip()
+YANDEX_MARKET_TOKEN = os.getenv("YANDEX_MARKET_API_KEY", "").strip() or os.getenv("YANDEX_MARKET_TOKEN", "").strip()
+YANDEX_MARKET_CAMPAIGN_ID_RAW = os.getenv("YANDEX_MARKET_CAMPAIGN_ID", "").strip()
 YANDEX_DELIVERY_TOKEN = os.getenv("YANDEX_DELIVERY_TOKEN", "").strip()
 CDEK_ACCOUNT = (os.getenv("CDEK_ACCOUNT", "") or os.getenv("CDEK_CLIENT_ID", "")).strip()
 CDEK_SECURE_PASSWORD = (os.getenv("CDEK_SECURE_PASSWORD", "") or os.getenv("CDEK_CLIENT_SECRET", "")).strip()
@@ -39,6 +41,7 @@ STATE_FILE = os.path.join(DATA_DIR, "state.json")
 
 sys.path.insert(0, str(BASE_DIR))
 from ozon import OzonClient, OzonError  # noqa: E402
+from yandex_market import YandexMarketClient, YandexMarketError  # noqa: E402
 from shipping import ShippingError, build_shipping_service, parse_dt  # noqa: E402
 from storage import Storage  # noqa: E402
 
@@ -50,6 +53,11 @@ logger = logging.getLogger("ozon_goods_bot")
 
 storage = Storage(STATE_FILE)
 ozon = OzonClient(OZON_CLIENT_ID, OZON_API_KEY)
+try:
+    yandex_market_campaign_id = int(YANDEX_MARKET_CAMPAIGN_ID_RAW) if YANDEX_MARKET_CAMPAIGN_ID_RAW else None
+except (TypeError, ValueError):
+    yandex_market_campaign_id = None
+ym_client = YandexMarketClient(YANDEX_MARKET_TOKEN, yandex_market_campaign_id)
 shipping = build_shipping_service(
     ozon_client=ozon,
     yandex_token=YANDEX_DELIVERY_TOKEN,
@@ -58,6 +66,8 @@ shipping = build_shipping_service(
     cdek_v1_url=CDEK_V1_URL,
     cdek_v2_url=CDEK_V2_URL,
     cdek_storage_days=CDEK_STORAGE_DAYS,
+    yandex_market_token=YANDEX_MARKET_TOKEN,
+    yandex_market_campaign_id=yandex_market_campaign_id,
 )
 
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -133,6 +143,17 @@ async def load_state() -> Dict[str, Any]:
     state.setdefault("report_hour_local", int(os.getenv("DAILY_REPORT_HOUR", "10") or 10))
     state.setdefault("orders_days", int(os.getenv("ORDERS_DAYS", "3") or 3))
     state.setdefault("stock_monitoring_enabled", True)
+    state.setdefault("store_mon_ozon", bool(OZON_CLIENT_ID and OZON_API_KEY))
+    state.setdefault("store_mon_ym", bool(YANDEX_MARKET_TOKEN))
+    state.setdefault("ym_offers", {})
+    state.setdefault("ym_orders_seen", [])
+    state.setdefault("ym_offers_initialized", False)
+    state.setdefault("ym_orders_initialized", False)
+    state.setdefault("store_mon_ym", bool(YANDEX_MARKET_TOKEN))
+    state.setdefault("ym_offers", {})
+    state.setdefault("ym_orders_seen", [])
+    state.setdefault("ym_offers_initialized", False)
+    state.setdefault("ym_orders_initialized", False)
     state.setdefault("delivery_warn_hours", DELIVERY_STORAGE_WARN_HOURS)
     state.setdefault("delivery_alerts", {})
     if ADMIN_CHAT_ID_RAW:
@@ -180,29 +201,33 @@ async def run_price_check(application: Application) -> None:
     threshold = float(state.get("threshold") or THRESHOLD_RUB)
     stock_threshold = int(state.get("stock_threshold", STOCK_ALERT_THRESHOLD) or 0)
     tracked = state.get("tracked") or {}
+    ozon_store_enabled = bool(state.get("store_mon_ozon", True)) and ozon.configured()
     tracked_ids = []
-    for k in tracked:
-        try:
-            tracked_ids.append(int(k))
-        except (ValueError, TypeError):
-            pass
-
-    # --- prices ---
-    price_map: Dict[int, Dict[str, Any]] = {}
-    try:
-        price_items = await ozon.fetch_prices()
-        for it in price_items:
-            pid = it.get("product_id")
-            if pid is None:
-                continue
+    if ozon_store_enabled:
+        for k in tracked:
             try:
-                price_map[int(pid)] = it
+                tracked_ids.append(int(k))
             except (ValueError, TypeError):
-                continue
-    except OzonError as e:
-        logger.error("Periodic price Ozon error: %s", e)
-        await send_to_admins(application, f"⚠️ Ошибка Ozon API (цены): {e}")
-        price_items = []
+                pass
+
+    price_map: Dict[int, Dict[str, Any]] = {}
+    price_items: List[Dict[str, Any]] = []
+    if ozon_store_enabled:
+        # --- prices ---
+        try:
+            price_items = await ozon.fetch_prices()
+            for it in price_items:
+                pid = it.get("product_id")
+                if pid is None:
+                    continue
+                try:
+                    price_map[int(pid)] = it
+                except (ValueError, TypeError):
+                    continue
+        except OzonError as e:
+            logger.error("Periodic price Ozon error: %s", e)
+            await send_to_admins(application, f"⚠️ Ошибка Ozon API (цены): {e}")
+            price_items = []
 
     # --- stocks ---
     stock_map: Dict[int, Dict[str, Any]] = {}
@@ -214,14 +239,116 @@ async def run_price_check(application: Application) -> None:
             await send_to_admins(application, f"⚠️ Ошибка Ozon API (остатки): {e}")
 
     # --- returns ---
+    if state.get("store_mon_ym", True) and ym_client.configured():
+        try:
+            ym_offers = await ym_client.fetch_offers()
+            ym_orders = await ym_client.fetch_orders(limit=100)
+            ym_recent: List[Dict[str, Any]] = []
+            for order in ym_orders:
+                created = order.get("creationDate") or order.get("createdAt") or order.get("created")
+                dt = None
+                if isinstance(created, str):
+                    try:
+                        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        dt = None
+                if dt is None or dt >= since_dt:
+                    ym_recent.append(order)
+            counts: Dict[str, int] = {}
+            for offer in ym_offers:
+                st = str(offer.get("status") or "unknown")
+                counts[st] = counts.get(st, 0) + 1
+            low = [o for o in ym_offers if str(o.get("status") or "").upper() in ("NO_STOCKS", "DISABLED_BY_PARTNER") or (isinstance(o.get("stock"), int) and int(o.get("stock") or 0) <= 0)]
+            lines.append("")
+            lines.append(f"🟡 Яндекс Маркет: офферов {len(ym_offers)}, заказов за 24ч {len(ym_recent)}")
+            if counts:
+                lines.append("Статусы YM: " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
+            if low:
+                lines.append(f"Офферы без остатка/выключенные YM: {len(low)}")
+                for o in low[:8]:
+                    lines.append(f"• {str(o.get('name') or o.get('offer_id'))[:60]} — статус {o.get('status')}, остаток {o.get('stock') if o.get('stock') is not None else '—'}")
+        except Exception as e:
+            logger.warning("YM daily report failed: %s", e)
+    if state.get("store_mon_ym", True) and ym_client.configured():
+        try:
+            ym_offers = await ym_client.fetch_offers()
+            ym_orders = await ym_client.fetch_orders(limit=100)
+            ym_recent: List[Dict[str, Any]] = []
+            for order in ym_orders:
+                created = order.get("creationDate") or order.get("createdAt") or order.get("created")
+                dt = None
+                if isinstance(created, str):
+                    try:
+                        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        dt = None
+                if dt is None or dt >= since_dt:
+                    ym_recent.append(order)
+            counts: Dict[str, int] = {}
+            for offer in ym_offers:
+                st = str(offer.get("status") or "unknown")
+                counts[st] = counts.get(st, 0) + 1
+            low = [o for o in ym_offers if str(o.get("status") or "").upper() in ("NO_STOCKS", "DISABLED_BY_PARTNER") or (isinstance(o.get("stock"), int) and int(o.get("stock") or 0) <= 0)]
+            lines.append("")
+            lines.append(f"🟡 Яндекс Маркет: офферы {len(ym_offers)}, заказов за 24ч {len(ym_recent)}")
+            if counts:
+                lines.append("Статусы YM: " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
+            if low:
+                lines.append(f"Офферы без остатка/выключенные YM: {len(low)}")
+                for o in low[:8]:
+                    lines.append(f"• {str(o.get('name') or o.get('offer_id'))[:60]} — статус {o.get('status')}, остаток {o.get('stock') if o.get('stock') is not None else '—'}")
+        except Exception as e:
+            logger.warning("YM daily report failed: %s", e)
+            lines.append(f"🟡 Яндекс Маркет недоступен: {e}")
+
+    if state.get("store_mon_ym", True) and ym_client.configured():
+        try:
+            ym_offers = await ym_client.fetch_offers()
+            ym_orders = await ym_client.fetch_orders(limit=100)
+            ym_recent: List[Dict[str, Any]] = []
+            for order in ym_orders:
+                created = order.get("creationDate") or order.get("createdAt") or order.get("created")
+                dt = None
+                if isinstance(created, str):
+                    try:
+                        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        dt = None
+                if dt is None or dt >= since_dt:
+                    ym_recent.append(order)
+            counts: Dict[str, int] = {}
+            for offer in ym_offers:
+                st = str(offer.get("status") or "unknown")
+                counts[st] = counts.get(st, 0) + 1
+            low = [o for o in ym_offers if str(o.get("status") or "").upper() in ("NO_STOCKS", "DISABLED_BY_PARTNER") or (isinstance(o.get("stock"), int) and int(o.get("stock") or 0) <= 0)]
+            lines.append("")
+            lines.append(f"🟡 Яндекс Маркет: офферов {len(ym_offers)}, заказов за 24ч {len(ym_recent)}")
+            if counts:
+                lines.append("Статусы YM: " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
+            if low:
+                lines.append(f"Офферы без остатка/выключенные YM: {len(low)}")
+                for o in low[:8]:
+                    lines.append(f"• {str(o.get('name') or o.get('offer_id'))[:60]} — статус {o.get('status')}, остаток {o.get('stock') if o.get('stock') is not None else '—'}")
+        except Exception as e:
+            logger.warning("YM daily report failed: %s", e)
+            lines.append(f"🟡 Яндекс Маркет недоступен: {e}")
+
+
     returns_list: List[Dict[str, Any]] = []
     returns_fetch_ok = True
-    try:
-        returns_list = await ozon.fetch_returns(limit=100)
-    except OzonError as e:
-        returns_fetch_ok = False
-        logger.error("Periodic returns Ozon error: %s", e)
-        await send_to_admins(application, f"⚠️ Ошибка Ozon API (возвраты): {e}")
+    if ozon_store_enabled:
+        try:
+            returns_list = await ozon.fetch_returns(limit=100)
+        except OzonError as e:
+            returns_fetch_ok = False
+            logger.error("Periodic returns Ozon error: %s", e)
+            await send_to_admins(application, f"⚠️ Ошибка Ozon API (возвраты): {e}")
 
     price_changes: List[Dict[str, Any]] = []
     stock_alerts: List[Dict[str, Any]] = []
@@ -377,12 +504,13 @@ async def run_price_check(application: Application) -> None:
     from datetime import timedelta as _td
     order_alerts = []
     orders_list = []
-    try:
-        _since = (datetime.now(timezone.utc) - _td(days=7)).isoformat()
-        _to = now_iso()
-        orders_list = await ozon.fetch_postings_fbs(_since, _to, 50) + await ozon.fetch_postings_fbo(_since, _to, 50)
-    except Exception as e:
-        logger.warning("orders fetch failed: %s", e)
+    if ozon_store_enabled:
+        try:
+            _since = (datetime.now(timezone.utc) - _td(days=7)).isoformat()
+            _to = now_iso()
+            orders_list = await ozon.fetch_postings_fbs(_since, _to, 50) + await ozon.fetch_postings_fbo(_since, _to, 50)
+        except Exception as e:
+            logger.warning("orders fetch failed: %s", e)
     known_postings = state.get("postings") or {}
     seen_numbers = set(known_postings.keys())
     orders_initialized = bool(state.get("orders_initialized"))
@@ -414,6 +542,83 @@ async def run_price_check(application: Application) -> None:
     state["postings"] = new_known
     if orders_list or not orders_initialized:
         state["orders_initialized"] = True
+    # --- Yandex Market offers/orders ---
+    ym_alert_lines: List[str] = []
+    if state.get("store_mon_ym", True) and ym_client.configured():
+        ym_offers_list: List[Dict[str, Any]] = []
+        ym_orders_list: List[Dict[str, Any]] = []
+        try:
+            ym_offers_list = await ym_client.fetch_offers()
+        except Exception as e:
+            logger.warning("YM offers fetch failed: %s", e)
+        try:
+            ym_orders_list = await ym_client.fetch_orders()
+        except Exception as e:
+            logger.warning("YM orders fetch failed: %s", e)
+
+        ym_known = state.get("ym_offers") or {}
+        ym_orders_seen = set(state.get("ym_orders_seen") or [])
+        ym_offers_initialized = bool(state.get("ym_offers_initialized", False))
+        ym_orders_initialized = bool(state.get("ym_orders_initialized", False))
+        new_ym_known = dict(ym_known)
+        new_ym_orders_seen = set(ym_orders_seen)
+        ym_offer_alerts: List[Dict[str, Any]] = []
+        for offer in ym_offers_list:
+            oid = offer.get("offer_id")
+            if oid is None:
+                continue
+            price = offer.get("basic_price")
+            status = offer.get("status")
+            detail = {"name": offer.get("name"), "price": price, "status": status}
+            prev = ym_known.get(oid)
+            if ym_offers_initialized:
+                if oid not in ym_known:
+                    ym_offer_alerts.append({"type": "новый оффер", "name": offer.get("name"), "offer_id": oid, "price": price, "status": status})
+                elif prev:
+                    try:
+                        prev_price = float(prev.get("price")) if prev.get("price") is not None else None
+                    except (TypeError, ValueError):
+                        prev_price = None
+                    try:
+                        cur_price = float(price) if price is not None else None
+                    except (TypeError, ValueError):
+                        cur_price = None
+                    if (cur_price is not None and prev_price is not None and abs(cur_price - prev_price) > threshold) or str(status).lower() != str(prev.get("status")).lower():
+                        ym_offer_alerts.append({"type": "изменение оффера", "name": offer.get("name"), "offer_id": oid, "old_price": prev_price, "price": cur_price, "old_status": prev.get("status"), "status": status})
+            new_ym_known[oid] = detail
+
+        ym_order_alerts: List[Dict[str, Any]] = []
+        for order in ym_orders_list:
+            oid = order.get("id") or order.get("orderId") or order.get("order_id")
+            if oid is None:
+                continue
+            oid = str(oid)
+            if ym_orders_initialized and oid not in ym_orders_seen:
+                ym_order_alerts.append(order)
+            new_ym_orders_seen.add(oid)
+
+        state["ym_offers"] = new_ym_known
+        state["ym_orders_seen"] = list(new_ym_orders_seen)[-2000:]
+        if ym_offers_list or not ym_offers_initialized:
+            state["ym_offers_initialized"] = True
+        if ym_orders_list or not ym_orders_initialized:
+            state["ym_orders_initialized"] = True
+
+        if ym_offer_alerts and ym_offers_initialized:
+            lines = [f"🟡 <b>Yandex Market: изменения офферов</b> ({len(ym_offer_alerts)}):"]
+            for o in ym_offer_alerts[:20]:
+                lines.append(
+                    f"• {html_escape(str(o.get('name') or o.get('offer_id')))[:80]} ({o.get('offer_id')})\n"
+                    f"  Тип: {o.get('type')}; статус: {o.get('status')}\n"
+                    + (f"  Цена: {fmt_money(o.get('price'))} ₽\n" if o.get("price") is not None else "")
+                )
+            await send_to_admins(application, "\n".join(lines))
+        if ym_order_alerts:
+            lines = [f"🛒 <b>Yandex Market: новые заказы</b> ({len(ym_order_alerts)}):"]
+            for o in ym_order_alerts[:20]:
+                lines.append(f"• {o.get('id') or o.get('orderId') or o.get('order_id')} — {o.get('status')}")
+            await send_to_admins(application, "\n".join(lines))
+
     # order_alerts_phase_daily
     state["last_check_summary"] = {
         "checked": len(tracked),
@@ -604,7 +809,7 @@ async def send_daily_report(application: Application) -> None:
 
     lines.append("")
     if posts:
-        lines.append(f"🛒 Заказы за 24ч ({count}):")
+        lines.append(f"🛒 Заказы Ozon за 24ч ({count}):")
         sorted_posts = sorted(
             posts,
             key=lambda p: p.get("created_at") or p.get("in_process_at") or "",
@@ -636,7 +841,7 @@ async def send_daily_report(application: Application) -> None:
 
     lines.append("")
     if zero_stock:
-        lines.append(f"📦 Нулевые остатки ({len(zero_stock)}):")
+        lines.append(f"📦 Нулевые остатки Ozon ({len(zero_stock)}):")
         for name, offer, fbo, fbs in zero_stock[:15]:
             label = html_escape(str(name)[:70])
             if offer:
@@ -650,6 +855,40 @@ async def send_daily_report(application: Application) -> None:
         lines.append("📦 Нулевых остатков нет.")
 
     lines.append("")
+    if state.get("store_mon_ym", True) and ym_client.configured():
+        try:
+            ym_offers = await ym_client.fetch_offers()
+            ym_orders = await ym_client.fetch_orders(limit=100)
+            ym_recent: List[Dict[str, Any]] = []
+            for order in ym_orders:
+                created = order.get("creationDate") or order.get("createdAt") or order.get("created")
+                dt = None
+                if isinstance(created, str):
+                    try:
+                        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        dt = None
+                if dt is None or dt >= since_dt:
+                    ym_recent.append(order)
+            counts: Dict[str, int] = {}
+            for offer in ym_offers:
+                st = str(offer.get("status") or "unknown")
+                counts[st] = counts.get(st, 0) + 1
+            low = [o for o in ym_offers if str(o.get("status") or "").upper() in ("NO_STOCKS", "DISABLED_BY_PARTNER") or (isinstance(o.get("stock"), int) and int(o.get("stock") or 0) <= 0)]
+            lines.append("")
+            lines.append(f"🟡 Яндекс Маркет: офферов {len(ym_offers)}, заказов за 24ч {len(ym_recent)}")
+            if counts:
+                lines.append("Статусы YM: " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
+            if low:
+                lines.append(f"Офферы без остатка/выключенные YM: {len(low)}")
+                for o in low[:8]:
+                    lines.append(f"• {str(o.get('name') or o.get('offer_id'))[:60]} — статус {o.get('status')}, остаток {o.get('stock') if o.get('stock') is not None else '—'}")
+        except Exception as e:
+            logger.warning("YM daily report failed: %s", e)
+            lines.append(f"🟡 Яндекс Маркет недоступен: {e}")
+
     if returns_list:
         lines.append(f"↩️ Возвраты за 24ч ({len(returns_list)}):")
         for r in returns_list[:10]:
@@ -686,6 +925,7 @@ DELIVERY_CONFIG_HINTS = {
     "ozon": "OZON_CLIENT_ID и OZON_API_KEY",
     "yandex": "YANDEX_DELIVERY_TOKEN",
     "cdek": "CDEK_ACCOUNT и CDEK_SECURE_PASSWORD",
+    "yandex_market": "YANDEX_MARKET_API_KEY",
 }
 
 
@@ -839,6 +1079,39 @@ async def build_delivery_report(provider_key: str, days: int) -> tuple[str, Inli
     cancelled.sort(key=lambda s: parse_dt(s.created_at) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     pickup_recent, expiring = _delivery_warning_counts(items, now, warn_hours)
 
+    if state.get("store_mon_ym", True) and ym_client.configured():
+        try:
+            ym_offers = await ym_client.fetch_offers()
+            ym_orders = await ym_client.fetch_orders(limit=100)
+            ym_recent: List[Dict[str, Any]] = []
+            for order in ym_orders:
+                created = order.get("creationDate") or order.get("createdAt") or order.get("created")
+                dt = None
+                if isinstance(created, str):
+                    try:
+                        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        dt = None
+                if dt is None or dt >= since_dt:
+                    ym_recent.append(order)
+            counts: Dict[str, int] = {}
+            for offer in ym_offers:
+                st = str(offer.get("status") or "unknown")
+                counts[st] = counts.get(st, 0) + 1
+            low = [o for o in ym_offers if str(o.get("status") or "").upper() in ("NO_STOCKS", "DISABLED_BY_PARTNER") or (isinstance(o.get("stock"), int) and int(o.get("stock") or 0) <= 0)]
+            lines.append("")
+            lines.append(f"🟡 Яндекс Маркет: офферов {len(ym_offers)}, заказов за 24ч {len(ym_recent)}")
+            if counts:
+                lines.append("Статусы YM: " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
+            if low:
+                lines.append(f"Офферы без остатка/выключенные YM: {len(low)}")
+                for o in low[:8]:
+                    lines.append(f"• {str(o.get('name') or o.get('offer_id'))[:60]} — статус {o.get('status')}, остаток {o.get('stock') if o.get('stock') is not None else '—'}")
+        except Exception as e:
+            logger.warning("YM daily report failed: %s", e)
+            lines.append(f"🟡 Яндекс Маркет недоступен: {e}")
     lines = [
         f"{provider.emoji} {provider.title} — {delivery_period_label(days)}",
         f"Всего: {len(items)} (в пути {len(transit)}, доставлено {len(delivered)}"
@@ -865,6 +1138,18 @@ async def build_delivery_report(provider_key: str, days: int) -> tuple[str, Inli
                 lines.append(f"  Товар: {short_text(s.product, 80)}" + (f" × {s.quantity}" if s.quantity else ""))
             if s.destination:
                 lines.append(f"  Куда: {short_text(s.destination, 100)}")
+            extra = s.extra or {}
+            if extra.get("ym_tracking") or s.tracking:
+                track = extra.get("ym_tracking") or s.tracking
+                if track and track != s.shipment_id:
+                    lines.append(f"  Трек: {short_text(track, 100)}")
+            recipient = extra.get("recipient_name") or extra.get("recipient")
+            if isinstance(recipient, dict):
+                recipient = recipient.get("recipient") or recipient.get("lastName")
+            if recipient:
+                lines.append(f"  Получатель: {short_text(recipient, 120)}")
+            if extra.get("ym_delivery_window"):
+                lines.append(f"  Интервал доставки: {short_text(extra.get('ym_delivery_window'), 70)}")
             if s.extra.get("pvz_address") and s.extra.get("pvz_address") not in str(s.destination or ""):
                 lines.append(f"  ПВЗ: {short_text(s.extra.get('pvz_address'), 120)}")
             if s.extra.get("pvz_phone"):
@@ -896,6 +1181,18 @@ async def build_delivery_report(provider_key: str, days: int) -> tuple[str, Inli
                 lines.append(f"  Товар: {short_text(s.product, 80)}" + (f" × {s.quantity}" if s.quantity else ""))
             if s.destination:
                 lines.append(f"  Куда: {short_text(s.destination, 100)}")
+            extra = s.extra or {}
+            if extra.get("ym_tracking") or s.tracking:
+                track = extra.get("ym_tracking") or s.tracking
+                if track and track != s.shipment_id:
+                    lines.append(f"  Трек: {short_text(track, 100)}")
+            recipient = extra.get("recipient_name") or extra.get("recipient")
+            if isinstance(recipient, dict):
+                recipient = recipient.get("recipient") or recipient.get("lastName")
+            if recipient:
+                lines.append(f"  Получатель: {short_text(recipient, 120)}")
+            if extra.get("ym_delivery_window"):
+                lines.append(f"  Интервал доставки: {short_text(extra.get('ym_delivery_window'), 70)}")
             if s.extra.get("pvz_address") and s.extra.get("pvz_address") not in str(s.destination or ""):
                 lines.append(f"  ПВЗ: {short_text(s.extra.get('pvz_address'), 120)}")
             if s.extra.get("pvz_phone"):
@@ -916,6 +1213,18 @@ async def build_delivery_report(provider_key: str, days: int) -> tuple[str, Inli
             lines.append(f"• {s.tracking or s.shipment_id} — {s.status}")
             if s.destination:
                 lines.append(f"  Куда: {short_text(s.destination, 100)}")
+            extra = s.extra or {}
+            if extra.get("ym_tracking") or s.tracking:
+                track = extra.get("ym_tracking") or s.tracking
+                if track and track != s.shipment_id:
+                    lines.append(f"  Трек: {short_text(track, 100)}")
+            recipient = extra.get("recipient_name") or extra.get("recipient")
+            if isinstance(recipient, dict):
+                recipient = recipient.get("recipient") or recipient.get("lastName")
+            if recipient:
+                lines.append(f"  Получатель: {short_text(recipient, 120)}")
+            if extra.get("ym_delivery_window"):
+                lines.append(f"  Интервал доставки: {short_text(extra.get('ym_delivery_window'), 70)}")
         if len(cancelled) > 5:
             lines.append(f"… и ещё {len(cancelled) - 5}")
 
@@ -998,7 +1307,13 @@ async def check_delivery_alerts(application: Application) -> None:
         # this limited to providers/statuses where it means handover to courier.
         status_time = parse_dt((shipment.extra or {}).get("status_time") or (shipment.extra or {}).get("yandex_status_time") or shipment.created_at)
         status_raw = str(shipment.status_code or "").upper()
-        courier_statuses = {"DELIVERY_TRANSPORTATION_RECIPIENT", "PERFORMER_FOUND", "DELIVERY_TRANSPORTATION_RECIPIENT"}
+        courier_statuses = {
+            "DELIVERY_TRANSPORTATION_RECIPIENT",
+            "PERFORMER_FOUND",
+            "DELIVERY_TRANSPORTATION_RECIPIENT",
+            "DELIVERY",
+            "TRANSPORTATION",
+        }
         if (not is_delivered) and status_raw in courier_statuses and status_time is not None and status_time >= now - timedelta(hours=24):
             key = f"{shipment.key}:courier"
             if key not in alerted:
@@ -1137,6 +1452,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/deliveries ozon 7 — пример отчёта по доставкам\n"
         "/deliveries yandex 14\n"
         "/deliveries cdek 30\n"
+        "/ym — офферы Яндекс Маркет (цены, статусы, склад, заказы)\n"
         "/returnstats — сводка возвратов по статусам\n"
         "/reviews [N] — последние отзывы\n"
         "/stock [N] — показать остатки FBO/FBS\n"
@@ -1245,6 +1561,15 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             tracked[str(pid)] = existing
             updated += 1
 
+    ym_offer_count = 0
+    if state.get("store_mon_ym", True) and ym_client.configured():
+        try:
+            ym_offers_list = await ym_client.fetch_offers()
+            state["ym_offers"] = {str(o.get("offer_id")): {"name": o.get("name"), "price": o.get("basic_price"), "status": o.get("status"), "stock": o.get("stock")} for o in ym_offers_list if o.get("offer_id") is not None}
+            state["ym_offers_initialized"] = bool(ym_offers_list)
+            ym_offer_count = len(ym_offers_list)
+        except Exception as e:
+            await send_to_admins(application, f"⚠️ Ошибка Yandex Market (синхронизация): {e}")
     ref_ids = {r["product_id"] for r in refs}
     removed = [pid for pid in list(tracked.keys()) if int(pid) not in ref_ids]
     for pid in removed:
@@ -1269,7 +1594,8 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Не найдено в refs: {len(removed)}\n"
         f"Цен получено: {len(price_map)}\n"
         f"Остатков получено: {len(stock_map)}\n"
-        f"Возвратов просмотрено: {len(returns_list)}",
+        f"Возвратов просмотрено: {len(returns_list)}\n"
+        + (f"Офферов Яндекс Маркет: {ym_offer_count}" if ym_offer_count else ""),
         reply_markup=inline_main_kb(),
     )
     await update.message.reply_text("Главное меню:", reply_markup=inline_main_kb())
@@ -1314,7 +1640,7 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         stock_map = await ozon.fetch_stocks([int(pid) for pid, _ in shown])
     except Exception as e:
         logger.warning("Stock display fetch failed: %s", e)
-    lines = [f"📦 Остатки ({len(tracked)}):"]
+    lines = [f"📦 Остатки Ozon ({len(tracked)}):"]
     for pid, meta in shown:
         name = meta.get("name") or f"Товар {pid}"
         st = stock_map.get(int(pid), {}) if str(pid).isdigit() else {}
@@ -1327,53 +1653,100 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"• {name}: FBO {fbo_text}, FBS {fbs_text}")
     if len(tracked) > len(shown):
         lines.append(f"… и ещё {len(tracked) - len(shown)}")
+    # Yandex Market stock available in the same screen, clearly labeled.
+    if state.get("store_mon_ym", True) and ym_client.configured():
+        try:
+            ym_offers = await ym_client.fetch_offers()
+            if ym_offers:
+                lines.append("")
+                lines.append("🟡 Яндекс Маркет:")
+                for offer in ym_offers[: min(20, len(ym_offers))]:
+                    lines.append(
+                        f"• {str(offer.get('name') or offer.get('offer_id'))[:60]}: "
+                        f"Остаток FIT {offer.get('stock') if offer.get('stock') is not None else '—'}, "
+                        f"статус {offer.get('status') or '—'}, цена {fmt_money(offer.get('basic_price'))} ₽"
+                    )
+        except Exception as e:
+            lines.append(f"YM stocks unavailable: {e}")
     await update.message.reply_text("\n".join(lines), reply_markup=inline_main_kb())
 
 async def cmd_returns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _admin_guard(update):
         return
     try:
-        n = int(context.args[0]) if context.args else 10
+        n = int(context.args[0]) if context.args else 5
     except (ValueError, IndexError):
-        n = 10
-    n = max(1, min(n, 50))
+        n = 5
+    n = max(1, min(n, 20))
+    lines = ["Возвраты (по 5 из каждого магазина):"]
     try:
         returns_list = await ozon.fetch_returns(limit=n)
     except OzonError as e:
-        await update.message.reply_text(f"❌ Ошибка Ozon: {e}")
-        return
-    if not returns_list:
-        await update.message.reply_text("Возвратов не найдено.")
-        return
-    returns_list = sorted(returns_list, key=lambda x: x.get("id", 0), reverse=True)
-    lines = [f"↩️ Последние возвраты: {len(returns_list)}"]
-    for r in returns_list[:n]:
-        prod = r.get("product", {}) if isinstance(r.get("product"), dict) else {}
-        name = prod.get("name") or prod.get("offer_id") or "товар"
-        if len(str(name)) > 60:
-            name = str(name)[:58] + "…"
-        offer = prod.get("offer_id")
-        rid = r.get("id")
-        schema = r.get("schema")
-        rtype = r.get("type")
-        reason = r.get("return_reason_name")
-        qty = prod.get("quantity")
-        order = r.get("order_number")
-        status = ""
-        vis = r.get("visual", {})
-        if isinstance(vis, dict) and isinstance(vis.get("status"), dict):
-            status = vis["status"].get("display_name") or vis["status"].get("sys_name") or ""
-        date = r.get("logistic", {}).get("return_date") if isinstance(r.get("logistic"), dict) else None
-        date = fmt_date(date)
-        lines.append(
-            f"\n📌 Возврат #{rid}\n"
-            f"• Товар: {name}" + (f" ({offer})" if offer else "") + "\n"
-            f"• Схема/тип: {schema} / {rtype}\n"
-            f"• Кол-во: {qty} шт | Статус: {status}\n"
-            f"• Причина: {reason}\n"
-            f"• Заказ: {order}\n"
-            f"• Дата: {date}"
-        )
+        returns_list = []
+        lines.append(f"❌ Ozon: {e}")
+    if returns_list:
+        returns_list = sorted(returns_list, key=lambda x: x.get("id", 0), reverse=True)[:n]
+        lines.append("")
+        lines.append(f"↩️ Возвраты Ozon ({len(returns_list)}):")
+        for r in returns_list:
+            prod = r.get("product", {}) if isinstance(r.get("product"), dict) else {}
+            name = prod.get("name") or prod.get("offer_id") or "товар"
+            if len(str(name)) > 60:
+                name = str(name)[:58] + "…"
+            offer = prod.get("offer_id")
+            rid = r.get("id")
+            schema = r.get("schema")
+            rtype = r.get("type")
+            reason = r.get("return_reason_name")
+            qty = prod.get("quantity")
+            order = r.get("order_number")
+            status = ""
+            vis = r.get("visual", {})
+            if isinstance(vis, dict) and isinstance(vis.get("status"), dict):
+                status = vis["status"].get("display_name") or vis["status"].get("sys_name") or ""
+            date = r.get("logistic", {}).get("return_date") if isinstance(r.get("logistic"), dict) else None
+            date = fmt_date(date)
+            lines.append(
+                f"\n📌 Возврат Ozon #{rid}\n"
+                f"• Товар: {name}" + (f" ({offer})" if offer else "") + "\n"
+                f"• Схема/тип: {schema} / {rtype}\n"
+                f"• Кол-во: {qty} шт | Статус: {status}\n"
+                f"• Причина: {reason}\n"
+                f"• Заказ: {order}\n"
+                f"• Дата: {date}"
+            )
+    else:
+        if not lines[-1].startswith("❌ Ozon"):
+            lines.append("")
+            lines.append("↩️ Возвраты Ozon: нет возвратов за период")
+    state = await load_state()
+    if state.get("store_mon_ym", True) and ym_client.configured():
+        try:
+            ym_returns = await ym_client.fetch_returns(limit=n)
+        except Exception as e:
+            ym_returns = []
+            lines.append(f"YM returns unavailable: {e}")
+        if ym_returns:
+            lines.append("")
+            lines.append(f"↩️ Возвраты Яндекс Маркет ({len(ym_returns)}):")
+            for r in ym_returns:
+                rid = r.get("RETURN_NUMBER") or r.get("returnNumber") or r.get("return_number") or r.get("orderId") or r.get("ORDER_ID")
+                offer = r.get("SHOP_SKU") or r.get("shopSku") or r.get("offerId") or r.get("offer_id")
+                name = r.get("PRODUCT_NAME") or r.get("productName") or r.get("offerName") or r.get("name") or "товар"
+                status = r.get("STATUS") or r.get("status") or ""
+                qty = r.get("COUNT") or r.get("count") or r.get("COUNT_OF_FIT")
+                date = r.get("DATE_OF_RETURN_CREATION") or r.get("dateOfReturnCreation") or r.get("RETURN_PICKED_DATE") or r.get("placementDate")
+                lines.append(
+                    f"\n📌 Возврат ЯМ #{rid}\n"
+                    f"• Товар: {name}" + (f" ({offer})" if offer else "") + "\n"
+                    f"• Кол-во: {qty} шт | Статус: {status}\n"
+                    f"• Дата: {fmt_date(date)}"
+                )
+        else:
+            lines.append("")
+            lines.append("↩️ Возвраты Яндекс Маркет: нет возвратов за 30 дней")
+    if len(lines) == 1:
+        lines.append("Возвратов не найдено.")
     await update.message.reply_text("\n".join(lines), reply_markup=inline_main_kb())
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1548,6 +1921,8 @@ async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 def settings_main_kb(state: Dict[str, Any]) -> InlineKeyboardMarkup:
     mon = bool(state.get("monitoring_enabled", True))
     stock_mon = bool(state.get("stock_monitoring_enabled", True))
+    store_ozon_mon = bool(state.get("store_mon_ozon", True))
+    store_ym_mon = bool(state.get("store_mon_ym", True))
     thr = fmt_money(state.get("threshold", THRESHOLD_RUB))
     interval = int(state.get("check_interval", CHECK_INTERVAL_SEC)) // 60
     report = state.get("report_hour_local", 10)
@@ -1563,6 +1938,8 @@ def settings_main_kb(state: Dict[str, Any]) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(f"📦 Остатки: {stock} шт", callback_data="set_page:stock")],
             [InlineKeyboardButton(f"⏰ Хранение: {warn} ч", callback_data="set_page:storage")],
             [InlineKeyboardButton((("🟢 ⏸ Выключить мониторинг остатков" if stock_mon else "🔴 ▶️ Включить мониторинг остатков")), callback_data="stockmonitor_toggle")],
+            [InlineKeyboardButton((("🟢 ⏸ Ozon мониторинг" if store_ozon_mon else "🔴 ▶️ Ozon мониторинг")), callback_data="storemonitor_ozon")],
+            [InlineKeyboardButton((("🟢 ⏸ ЯМ мониторинг" if store_ym_mon else "🔴 ▶️ ЯМ мониторинг")), callback_data="storemonitor_ym")],
             [InlineKeyboardButton((("🟢 ⏸ Выключить мониторинг" if mon else "🔴 ▶️ Включить мониторинг")), callback_data="monitor_toggle")],
             [InlineKeyboardButton("🏠 Главное меню", callback_data="help_now")],
         ]
@@ -1608,6 +1985,8 @@ def settings_page_text(page: str, state: Dict[str, Any]) -> str:
     now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     mon = "включён" if state.get("monitoring_enabled", True) else "выключен"
     stock_mon = "включён" if state.get("stock_monitoring_enabled", True) else "выключен"
+    store_ozon_mon = "включён" if state.get("store_mon_ozon", True) else "выключен"
+    store_ym_mon = "включён" if state.get("store_mon_ym", True) else "выключен"
     thr = fmt_money(state.get("threshold", THRESHOLD_RUB))
     interval = int(state.get("check_interval", CHECK_INTERVAL_SEC)) // 60
     report = state.get("report_hour_local", 10)
@@ -1634,6 +2013,8 @@ def settings_page_text(page: str, state: Dict[str, Any]) -> str:
         "⚙️ Настройки\n"
         f"Мониторинг: {mon}\n"
         f"Мониторинг остатков: {stock_mon}\n"
+        f"Ozon мониторинг: {store_ozon_mon}\n"
+        f"Яндекс Маркет мониторинг: {store_ym_mon}\n"
         f"Порог цены: {thr} ₽\n"
         f"Порог остатков: {stock} шт\n"
         f"Интервал проверки: {interval} мин\n"
@@ -1675,7 +2056,7 @@ async def build_list_view(offset: int):
         stock_map = await ozon.fetch_stocks([int(pid) for pid, _ in page])
     except Exception as e:
         logger.debug("list stock fetch failed: %s", e)
-    lines = [f"📋 Товары ({total}), страница {offset // PAGE_SIZE + 1}/{pages}:"]
+    lines = [f"📋 Товары Ozon ({total}), страница {offset // PAGE_SIZE + 1}/{pages}:"]
     for i, (pid, meta) in enumerate(page, start=offset + 1):
         name = meta.get("name") or f"Товар {pid}"
         offer = meta.get("offer_id")
@@ -1710,6 +2091,20 @@ async def build_list_view(offset: int):
             InlineKeyboardButton("🏠 Меню", callback_data="help_now"),
         ]
     )
+
+    state = await load_state()
+    if state.get("store_mon_ym", True) and ym_client.configured():
+        try:
+            ym_offers = await ym_client.fetch_offers()
+            if ym_offers:
+                lines.append("")
+                lines.append(f"🟡 Яндекс Маркет ({len(ym_offers)}):")
+                for offer in ym_offers[:8]:
+                    stock_txt = f", остаток FIT {offer.get('stock')}" if offer.get("stock") is not None else ""
+                    lines.append(f"• {str(offer.get('name') or offer.get('offer_id'))[:60]} — {offer.get('status') or '—'}, {fmt_money(offer.get('basic_price'))} ₽{stock_txt}")
+        except Exception as e:
+            lines.append(f"YM offers unavailable: {e}")
+
     kb = InlineKeyboardMarkup(buttons)
     return "\n".join(lines), kb
 
@@ -1800,6 +2195,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await show_settings_page(query.message, page, edit=True)
         return
     if data == "settings_back":
+        await show_settings_page(query.message, "main", edit=True)
+        return
+    if data == "storemonitor_ozon":
+        state = await load_state()
+        if query.from_user.id not in state.get("admins", []):
+            return
+        state["store_mon_ozon"] = not bool(state.get("store_mon_ozon", True))
+        await storage.save(state)
+        await show_settings_page(query.message, "main", edit=True)
+        return
+    if data == "storemonitor_ym":
+        state = await load_state()
+        if query.from_user.id not in state.get("admins", []):
+            return
+        state["store_mon_ym"] = not bool(state.get("store_mon_ym", True))
+        await storage.save(state)
         await show_settings_page(query.message, "main", edit=True)
         return
     if data == "stockmonitor_toggle":
@@ -1996,7 +2407,7 @@ async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     state = await load_state()
     tracked = state.get("tracked") or {}
-    lines = ["💰 Все доступные цены Ozon:\n"]
+    lines = ["💰 Цены Ozon:\n"]
     for item in prices:
         pid = item.get("product_id")
         meta = tracked.get(str(pid), {}) if pid is not None else {}
@@ -2015,6 +2426,25 @@ async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append(f"  Ozon-индекс: {fmt_money(oz_idx.get('min_price'))} ₽")
         lines.append(f"  Конкуренты: {fmt_money(ext_idx.get('min_price'))} ₽")
         lines.append("")
+    state = await load_state()
+    if state.get("store_mon_ym", True) and ym_client.configured():
+        try:
+            ym_offers = await ym_client.fetch_offers()
+            if ym_offers:
+                lines.append("")
+                lines.append("🟡 Цены Яндекс Маркет:")
+                for offer in ym_offers[:20]:
+                    lines.append(
+                        f"• {str(offer.get('name') or offer.get('offer_id'))[:60]} ({offer.get('offer_id')})"
+                    )
+                    lines.append(f"  Цена Яндекс Маркета: {fmt_money(offer.get('basic_price'))} ₽")
+                    lines.append(f"  Статус: {offer.get('status') or '—'}")
+                    if offer.get("stock") is not None:
+                        lines.append(f"  Остаток FIT: {offer.get('stock')}")
+                    lines.append("")
+        except Exception as e:
+            lines.append(f"YM prices unavailable: {e}")
+
     await update.message.reply_text("\n".join(lines).strip(), reply_markup=inline_main_kb())
 
 async def cmd_orders(update, context):
@@ -2035,11 +2465,15 @@ async def cmd_orders(update, context):
     except OzonError as e:
         await update.message.reply_text('Ошибка Ozon: ' + str(e), reply_markup=inline_main_kb())
         return
+        await update.message.reply_text('Ошибка Ozon: ' + str(e), reply_markup=inline_main_kb())
+        return
+
+    await update.message.reply_text("\n".join(lines), reply_markup=inline_main_kb())
     if not posts:
         await update.message.reply_text('Заказов за ' + str(days) + ' дней не найдено.', reply_markup=inline_main_kb())
         return
     posts = sorted(posts, key=lambda p: p.get('created_at') or p.get('in_process_at') or '', reverse=True)
-    lines = ['Заказы за ' + str(days) + ' дней (' + str(len(posts)) + '):']
+    lines = ['Заказы Ozon за ' + str(days) + ' дней (' + str(len(posts)) + '):']
     for p in posts[:20]:
         pn = p.get('posting_number')
         scheme = (p.get('delivery_scheme') or '').upper() or ('FBO' if p.get('storage_type') is not None or not p.get('delivery_method') else 'FBS')
@@ -2065,6 +2499,23 @@ async def cmd_orders(update, context):
         price_str = str(price) if price not in (None, '') else '-'
         lines.append('Кол-во/цена: ' + qty_str + ' x ' + price_str + ' RUB')
         lines.append('Создан: ' + str(created))
+    state = await load_state()
+    if state.get("store_mon_ym", True) and ym_client.configured():
+        try:
+            ym_orders = await ym_client.fetch_orders(limit=20)
+        except Exception as e:
+            ym_orders = []
+            lines.append(f"YM orders unavailable: {e}")
+        if ym_orders:
+            lines.append("")
+            lines.append(f"🟡 Заказы Яндекс Маркет ({len(ym_orders)}):")
+            for order in ym_orders:
+                oid = order.get("id") or order.get("orderId") or order.get("order_id") or "—"
+                lines.append(f"• ЯМ {oid} — {order.get('status') or order.get('substatus') or '—'}")
+                created = order.get("creationDate") or order.get("createdAt") or order.get("created")
+                if created:
+                    lines.append(f"  Создан: {fmt_date(created)}")
+
     await update.message.reply_text(chr(10).join(lines), reply_markup=inline_main_kb())
     try:
         state = await load_state()
@@ -2140,7 +2591,7 @@ async def cmd_reviews(update, context):
         await update.message.reply_text('❌ Ошибка Ozon: ' + str(e), reply_markup=inline_main_kb())
         return
     if not reviews:
-        await update.message.reply_text('Отзывов не найдено.', reply_markup=inline_main_kb())
+        await update.message.reply_text('Отзывов Ozon не найдено.', reply_markup=inline_main_kb())
         return
     _per_product = _mode in ('per', 'latest', 'products')
     if _mode in ('all', 'last', 'recent'):
@@ -2162,9 +2613,9 @@ async def cmd_reviews(update, context):
     except Exception:
         sku_info = {}
     if _per_product:
-        lines = ['⭐ Отзывы: последний по каждому товару (' + str(len(selected)) + ')']
+        lines = ['⭐ Отзывы Ozon: последний по каждому товару (' + str(len(selected)) + ')']
     else:
-        lines = ['⭐ Отзывы: показано ' + str(len(selected)) + ' из ' + str(len(reviews))]
+        lines = ['⭐ Отзывы Ozon: показано ' + str(len(selected)) + ' из ' + str(len(reviews))]
     for r in selected:
         sku = r.get('sku')
         sku_i = int(sku) if isinstance(sku, (int, str)) and str(sku).isdigit() else None
@@ -2172,15 +2623,33 @@ async def cmd_reviews(update, context):
         name = info.get('name') or ('SKU ' + str(sku))
         rating = r.get('rating')
         text = str(r.get('text') or '').replace(chr(10), ' ')[:180]
-        published = fmt_date(r.get('published_at'))
+        published = r.get('published_at')
         comments = r.get('comments_amount')
         photos = r.get('photos_amount')
         lines.append('')
         lines.append('⭐ Рейтинг: ' + str(rating))
         lines.append('• ' + name)
         lines.append('  Текст: ' + (text or '—'))
-        lines.append('  Опубликовано: ' + str(published))
+        lines.append('  Опубликовано: ' + str(fmt_date(published)))
         lines.append('  Комментарии: ' + str(comments) + ', фото: ' + str(photos))
+    state = await load_state()
+    if state.get("store_mon_ym", True) and ym_client.configured():
+        try:
+            ym_reviews = await ym_client.fetch_reviews(limit=n)
+        except Exception as e:
+            ym_reviews = []
+            lines.append(f"YM reviews unavailable: {e}")
+        if ym_reviews:
+            lines.append("")
+            lines.append('🟡 Отзывы Яндекс Маркет (' + str(len(ym_reviews)) + '):')
+            for item in ym_reviews[:n]:
+                name = item.get("offerId") or item.get("offer_id")
+                rating = item.get("grade") if "grade" in item else item.get("rating")
+                text = str(item.get("text") or "").replace(chr(10), " ")[:180]
+                published = item.get("creationDate") or item.get("createDate") or item.get("published_at")
+                lines.append('• ' + (str(name) if name is not None else ('SKU ' + str(item.get('sku')))) + ' ⭐' + str(rating))
+                lines.append('  ' + (text or '—'))
+                lines.append('  Опубликовано: ' + str(fmt_date(published)))
     await update.message.reply_text(chr(10).join(lines), reply_markup=inline_main_kb())
 
 async def cmd_setreporttime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2288,6 +2757,44 @@ async def cmd_returnstats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         lines.append(f"• {k}: {v}")
     await update.message.reply_text("\n".join(lines), reply_markup=inline_main_kb())
 
+async def cmd_ym(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _admin_guard(update):
+        return
+    state = await load_state()
+    if not state.get("store_mon_ym", True):
+        await update.message.reply_text("Мониторинг Яндекс Маркета выключен в Настройках.", reply_markup=inline_main_kb())
+        return
+    if not ym_client.configured():
+        await update.message.reply_text("Яндекс Маркет не настроен. Заполните YANDEX_MARKET_API_KEY.", reply_markup=inline_main_kb())
+        return
+    try:
+        offers = await ym_client.fetch_offers()
+        orders = await ym_client.fetch_orders(limit=20)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка Yandex Market: {e}", reply_markup=inline_main_kb())
+        return
+    status_counts: Dict[str, int] = {}
+    for offer in offers:
+        st = str(offer.get("status") or "unknown")
+        status_counts[st] = status_counts.get(st, 0) + 1
+    lines = [f"🟡 Яндекс Маркет — офферы ({len(offers)}):"]
+    if status_counts:
+        lines.append("Статусы: " + ", ".join(f"{k}: {v}" for k, v in sorted(status_counts.items())))
+    if not offers:
+        lines.append("Офферы не найдены.")
+    for offer in offers[:20]:
+        name = str(offer.get("name") or offer.get("offer_id") or "оффер")[:70]
+        lines.append(f"• {name} ({offer.get('offer_id')}) — {offer.get('status') or '—'}; цена {fmt_money(offer.get('basic_price'))} ₽")
+    if orders:
+        lines.append("")
+        lines.append(f"Заказы ЯМ ({len(orders)}):")
+        for order in orders[:10]:
+            oid = order.get("id") or order.get("orderId") or order.get("order_id") or "—"
+            status = order.get("status") or order.get("substatus") or "—"
+            created = order.get("creationDate") or order.get("createdAt") or order.get("created")
+            lines.append(f"• {oid} — {status}" + (f", создан: {fmt_date(created)}" if created else ""))
+    await update.message.reply_text("\n".join(lines), reply_markup=inline_main_kb())
+
 def main() -> None:
     if not BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN is not set in .env")
@@ -2314,6 +2821,8 @@ def main() -> None:
     app.add_handler(CommandHandler("deliveries", cmd_deliveries))
     app.add_handler(CommandHandler("delivery", cmd_deliveries))
     app.add_handler(CommandHandler("shipping", cmd_deliveries))
+    app.add_handler(CommandHandler("ym", cmd_ym))
+    app.add_handler(CommandHandler("yandexmarket", cmd_ym))
     app.add_handler(CommandHandler("returnstats", cmd_returnstats))
     app.add_handler(CommandHandler("order", cmd_orders))
     app.add_handler(CommandHandler("reviews", cmd_reviews))
