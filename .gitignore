@@ -1,0 +1,11 @@
+.env
+data/
+__pycache__/
+*.pyc
+*.log
+*.tmp
+venv/
+.venv/
+instance/
+backups/
+local/
