@@ -1079,39 +1079,6 @@ async def build_delivery_report(provider_key: str, days: int) -> tuple[str, Inli
     cancelled.sort(key=lambda s: parse_dt(s.created_at) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     pickup_recent, expiring = _delivery_warning_counts(items, now, warn_hours)
 
-    if state.get("store_mon_ym", True) and ym_client.configured():
-        try:
-            ym_offers = await ym_client.fetch_offers()
-            ym_orders = await ym_client.fetch_orders(limit=100)
-            ym_recent: List[Dict[str, Any]] = []
-            for order in ym_orders:
-                created = order.get("creationDate") or order.get("createdAt") or order.get("created")
-                dt = None
-                if isinstance(created, str):
-                    try:
-                        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                    except ValueError:
-                        dt = None
-                if dt is None or dt >= since_dt:
-                    ym_recent.append(order)
-            counts: Dict[str, int] = {}
-            for offer in ym_offers:
-                st = str(offer.get("status") or "unknown")
-                counts[st] = counts.get(st, 0) + 1
-            low = [o for o in ym_offers if str(o.get("status") or "").upper() in ("NO_STOCKS", "DISABLED_BY_PARTNER") or (isinstance(o.get("stock"), int) and int(o.get("stock") or 0) <= 0)]
-            lines.append("")
-            lines.append(f"🟡 Яндекс Маркет: офферов {len(ym_offers)}, заказов за 24ч {len(ym_recent)}")
-            if counts:
-                lines.append("Статусы YM: " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
-            if low:
-                lines.append(f"Офферы без остатка/выключенные YM: {len(low)}")
-                for o in low[:8]:
-                    lines.append(f"• {str(o.get('name') or o.get('offer_id'))[:60]} — статус {o.get('status')}, остаток {o.get('stock') if o.get('stock') is not None else '—'}")
-        except Exception as e:
-            logger.warning("YM daily report failed: %s", e)
-            lines.append(f"🟡 Яндекс Маркет недоступен: {e}")
     lines = [
         f"{provider.emoji} {provider.title} — {delivery_period_label(days)}",
         f"Всего: {len(items)} (в пути {len(transit)}, доставлено {len(delivered)}"
@@ -1143,21 +1110,15 @@ async def build_delivery_report(provider_key: str, days: int) -> tuple[str, Inli
                 track = extra.get("ym_tracking") or s.tracking
                 if track and track != s.shipment_id:
                     lines.append(f"  Трек: {short_text(track, 100)}")
-            recipient = extra.get("recipient_name") or extra.get("recipient")
-            if isinstance(recipient, dict):
-                recipient = recipient.get("recipient") or recipient.get("lastName")
-            if recipient:
-                lines.append(f"  Получатель: {short_text(recipient, 120)}")
+            # recipient is printed below without duplicates
             if extra.get("ym_delivery_window"):
                 lines.append(f"  Интервал доставки: {short_text(extra.get('ym_delivery_window'), 70)}")
             if s.extra.get("pvz_address") and s.extra.get("pvz_address") not in str(s.destination or ""):
                 lines.append(f"  ПВЗ: {short_text(s.extra.get('pvz_address'), 120)}")
             if s.extra.get("pvz_phone"):
                 lines.append(f"  Телефон ПВЗ: {short_text(s.extra.get('pvz_phone'), 40)}")
-            if s.extra.get("recipient_name"):
-                recipient = s.extra.get("recipient_name")
-                if s.extra.get("recipient_phone"):
-                    recipient += f", {s.extra.get('recipient_phone')}"
+            if s.extra.get("recipient_name") and s.extra.get("recipient_phone"):
+                recipient = f"{s.extra.get('recipient_name')}, {s.extra.get('recipient_phone')}"
                 lines.append(f"  Получатель: {short_text(recipient, 120)}")
             if s.pickup_ready_at:
                 lines.append(f"  📍 В ПВЗ: {fmt_date(s.pickup_ready_at)}")
@@ -1186,21 +1147,15 @@ async def build_delivery_report(provider_key: str, days: int) -> tuple[str, Inli
                 track = extra.get("ym_tracking") or s.tracking
                 if track and track != s.shipment_id:
                     lines.append(f"  Трек: {short_text(track, 100)}")
-            recipient = extra.get("recipient_name") or extra.get("recipient")
-            if isinstance(recipient, dict):
-                recipient = recipient.get("recipient") or recipient.get("lastName")
-            if recipient:
-                lines.append(f"  Получатель: {short_text(recipient, 120)}")
+            # recipient is printed below without duplicates
             if extra.get("ym_delivery_window"):
                 lines.append(f"  Интервал доставки: {short_text(extra.get('ym_delivery_window'), 70)}")
             if s.extra.get("pvz_address") and s.extra.get("pvz_address") not in str(s.destination or ""):
                 lines.append(f"  ПВЗ: {short_text(s.extra.get('pvz_address'), 120)}")
             if s.extra.get("pvz_phone"):
                 lines.append(f"  Телефон ПВЗ: {short_text(s.extra.get('pvz_phone'), 40)}")
-            if s.extra.get("recipient_name"):
-                recipient = s.extra.get("recipient_name")
-                if s.extra.get("recipient_phone"):
-                    recipient += f", {s.extra.get('recipient_phone')}"
+            if s.extra.get("recipient_name") and s.extra.get("recipient_phone"):
+                recipient = f"{s.extra.get('recipient_name')}, {s.extra.get('recipient_phone')}"
                 lines.append(f"  Получатель: {short_text(recipient, 120)}")
             lines.append(f"  Доставлен: {fmt_date(s.delivered_at) if s.delivered_at else '—'}")
         if len(delivered) > 8:
@@ -1218,11 +1173,7 @@ async def build_delivery_report(provider_key: str, days: int) -> tuple[str, Inli
                 track = extra.get("ym_tracking") or s.tracking
                 if track and track != s.shipment_id:
                     lines.append(f"  Трек: {short_text(track, 100)}")
-            recipient = extra.get("recipient_name") or extra.get("recipient")
-            if isinstance(recipient, dict):
-                recipient = recipient.get("recipient") or recipient.get("lastName")
-            if recipient:
-                lines.append(f"  Получатель: {short_text(recipient, 120)}")
+            # recipient is printed below without duplicates
             if extra.get("ym_delivery_window"):
                 lines.append(f"  Интервал доставки: {short_text(extra.get('ym_delivery_window'), 70)}")
         if len(cancelled) > 5:
@@ -1473,7 +1424,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _admin_guard(update):
         return
-    msg = await update.message.reply_text("⏳ Синхронизирую товары из Ozon…")
+    msg = await update.message.reply_text("⏳ Синхронизирую Ozon и Яндекс Маркет…")
     try:
         refs = await ozon.list_products()
     except OzonError as e:
@@ -1569,7 +1520,9 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             state["ym_offers_initialized"] = bool(ym_offers_list)
             ym_offer_count = len(ym_offers_list)
         except Exception as e:
-            await send_to_admins(application, f"⚠️ Ошибка Yandex Market (синхронизация): {e}")
+            await send_to_admins(application, f"YM sync failed: {e}")
+            ym_offer_count = 0
+
     ref_ids = {r["product_id"] for r in refs}
     removed = [pid for pid in list(tracked.keys()) if int(pid) not in ref_ids]
     for pid in removed:
@@ -1599,77 +1552,6 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=inline_main_kb(),
     )
     await update.message.reply_text("Главное меню:", reply_markup=inline_main_kb())
-
-async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _admin_guard(update):
-        return
-    await update.message.reply_text("⏳ Проверяю цены/остатки/возвраты и доставки…")
-    await run_price_check(context.application)
-    try:
-        await check_delivery_alerts(context.application)
-    except Exception as e:
-        logger.warning("Delivery check failed: %s", e)
-    await update.message.reply_text("✅ Проверка завершена. Уведомления отправлены при изменениях.", reply_markup=inline_main_kb())
-
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _admin_guard(update):
-        return
-    state = await load_state()
-    tracked = state.get("tracked") or {}
-    if not tracked:
-        await update.message.reply_text("Список пуст. Выполните /sync.", reply_markup=ReplyKeyboardRemove())
-        return
-    await show_list_view(update.message, 0, edit=False)
-
-async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _admin_guard(update):
-        return
-    state = await load_state()
-    tracked = state.get("tracked") or {}
-    if not tracked:
-        await update.message.reply_text("Список пуст. Выполните /sync.")
-        return
-    try:
-        n = int(context.args[0]) if context.args else 20
-    except (ValueError, IndexError):
-        n = 20
-    n = max(1, min(n, 50))
-    shown = list(tracked.items())[:n]
-    stock_map = {}
-    try:
-        stock_map = await ozon.fetch_stocks([int(pid) for pid, _ in shown])
-    except Exception as e:
-        logger.warning("Stock display fetch failed: %s", e)
-    lines = [f"📦 Остатки Ozon ({len(tracked)}):"]
-    for pid, meta in shown:
-        name = meta.get("name") or f"Товар {pid}"
-        st = stock_map.get(int(pid), {}) if str(pid).isdigit() else {}
-        fbo = st.get("fbo", meta.get("fbo"))
-        fbo_reserved = st.get("fbo_reserved")
-        fbs = st.get("fbs", meta.get("fbs"))
-        fbs_reserved = st.get("fbs_reserved")
-        fbo_text = f"{fbo if fbo is not None else '—'} (резерв {fbo_reserved if fbo_reserved is not None else '—'})"
-        fbs_text = f"{fbs if fbs is not None else '—'} (резерв {fbs_reserved if fbs_reserved is not None else '—'})"
-        lines.append(f"• {name}: FBO {fbo_text}, FBS {fbs_text}")
-    if len(tracked) > len(shown):
-        lines.append(f"… и ещё {len(tracked) - len(shown)}")
-    # Yandex Market stock available in the same screen, clearly labeled.
-    if state.get("store_mon_ym", True) and ym_client.configured():
-        try:
-            ym_offers = await ym_client.fetch_offers()
-            if ym_offers:
-                lines.append("")
-                lines.append("🟡 Яндекс Маркет:")
-                for offer in ym_offers[: min(20, len(ym_offers))]:
-                    lines.append(
-                        f"• {str(offer.get('name') or offer.get('offer_id'))[:60]}: "
-                        f"Остаток FIT {offer.get('stock') if offer.get('stock') is not None else '—'}, "
-                        f"статус {offer.get('status') or '—'}, цена {fmt_money(offer.get('basic_price'))} ₽"
-                    )
-        except Exception as e:
-            lines.append(f"YM stocks unavailable: {e}")
-    await update.message.reply_text("\n".join(lines), reply_markup=inline_main_kb())
-
 async def cmd_returns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _admin_guard(update):
         return
@@ -2838,6 +2720,81 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_menu))
     logger.info("Starting bot; data dir=%s", DATA_DIR)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _admin_guard(update):
+        return
+    await update.message.reply_text("⏳ Проверяю цены/остатки/возвраты и доставки…")
+    await run_price_check(context.application)
+    try:
+        await check_delivery_alerts(context.application)
+    except Exception as e:
+        logger.warning("Delivery check failed: %s", e)
+    await update.message.reply_text("✅ Проверка завершена. Уведомления отправлены при изменениях.", reply_markup=inline_main_kb())
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _admin_guard(update):
+        return
+    state = await load_state()
+    tracked = state.get("tracked") or {}
+    if not tracked:
+        await update.message.reply_text("Список пуст. Выполните /sync.", reply_markup=ReplyKeyboardRemove())
+        return
+    try:
+        n = int(context.args[0]) if context.args else 20
+    except (ValueError, IndexError):
+        n = 20
+    n = max(1, min(n, 100))
+    await show_list_view(update.message, 0, edit=False)
+
+
+async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _admin_guard(update):
+        return
+    state = await load_state()
+    tracked = state.get("tracked") or {}
+    if not tracked:
+        await update.message.reply_text("Список пуст. Выполните /sync.", reply_markup=inline_main_kb())
+        return
+    try:
+        n = int(context.args[0]) if context.args else 20
+    except (ValueError, IndexError):
+        n = 20
+    n = max(1, min(n, 50))
+    shown = list(tracked.items())[:n]
+    stock_map = {}
+    try:
+        stock_map = await ozon.fetch_stocks([int(pid) for pid, _ in shown])
+    except Exception as e:
+        logger.warning("Stock display fetch failed: %s", e)
+    lines = [f"📦 Остатки Ozon ({len(tracked)}):"]
+    for pid, meta in shown:
+        name = meta.get("name") or f"Товар {pid}"
+        st = stock_map.get(int(pid), {}) if str(pid).isdigit() else {}
+        fbo = st.get("fbo", meta.get("fbo"))
+        fbo_reserved = st.get("fbo_reserved")
+        fbs = st.get("fbs", meta.get("fbs"))
+        fbs_reserved = st.get("fbs_reserved")
+        fbo_text = f"{fbo if fbo is not None else '—'} (резерв {fbo_reserved if fbo_reserved is not None else '—'})"
+        fbs_text = f"{fbs if fbs is not None else '—'} (резерв {fbs_reserved if fbs_reserved is not None else '—'})"
+        lines.append(f"• {name}: FBO {fbo_text}, FBS {fbs_text}")
+    if len(tracked) > len(shown):
+        lines.append(f"… и ещё {len(tracked) - len(shown)}")
+    if state.get("store_mon_ym", True) and ym_client.configured():
+        try:
+            ym_offers = await ym_client.fetch_offers()
+            if ym_offers:
+                lines.append("")
+                lines.append("🟡 Яндекс Маркет:")
+                for offer in ym_offers[:20]:
+                    lines.append(
+                        f"• {str(offer.get('name') or offer.get('offer_id'))[:60]}: "
+                        f"Остаток FIT {offer.get('stock') if offer.get('stock') is not None else '—'}, "
+                        f"статус {offer.get('status') or '—'}, цена {fmt_money(offer.get('basic_price'))} ₽"
+                    )
+        except Exception as e:
+            lines.append(f"YM stocks unavailable: {e}")
+    await update.message.reply_text("\n".join(lines), reply_markup=inline_main_kb())
 
 if __name__ == "__main__":
     main()
