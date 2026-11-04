@@ -81,6 +81,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
 )
 
 PAGE_SIZE = 8
+MSK_TZ = timezone(timedelta(hours=3))
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -102,7 +103,7 @@ def fmt_date(v: Any) -> str:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        local = dt.astimezone()
+        local = dt.astimezone(MSK_TZ)
         return local.strftime("%d.%m.%Y %H:%M")
     except (ValueError, TypeError):
         return str(v)
@@ -115,7 +116,7 @@ def fmt_delivery_date(v: Any) -> str:
     s = str(v).strip()
     if len(s) <= 10:
         dt = parse_dt(s)
-        return dt.astimezone().strftime("%d.%m.%Y") if dt else s
+        return dt.astimezone(MSK_TZ).strftime("%d.%m.%Y") if dt else s
     return fmt_date(s)
 
 
@@ -239,107 +240,6 @@ async def run_price_check(application: Application) -> None:
             await send_to_admins(application, f"⚠️ Ошибка Ozon API (остатки): {e}")
 
     # --- returns ---
-    if state.get("store_mon_ym", True) and ym_client.configured():
-        try:
-            ym_offers = await ym_client.fetch_offers()
-            ym_orders = await ym_client.fetch_orders(limit=100)
-            ym_recent: List[Dict[str, Any]] = []
-            for order in ym_orders:
-                created = order.get("creationDate") or order.get("createdAt") or order.get("created")
-                dt = None
-                if isinstance(created, str):
-                    try:
-                        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                    except ValueError:
-                        dt = None
-                if dt is None or dt >= since_dt:
-                    ym_recent.append(order)
-            counts: Dict[str, int] = {}
-            for offer in ym_offers:
-                st = str(offer.get("status") or "unknown")
-                counts[st] = counts.get(st, 0) + 1
-            low = [o for o in ym_offers if str(o.get("status") or "").upper() in ("NO_STOCKS", "DISABLED_BY_PARTNER") or (isinstance(o.get("stock"), int) and int(o.get("stock") or 0) <= 0)]
-            lines.append("")
-            lines.append(f"🟡 Яндекс Маркет: офферов {len(ym_offers)}, заказов за 24ч {len(ym_recent)}")
-            if counts:
-                lines.append("Статусы YM: " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
-            if low:
-                lines.append(f"Офферы без остатка/выключенные YM: {len(low)}")
-                for o in low[:8]:
-                    lines.append(f"• {str(o.get('name') or o.get('offer_id'))[:60]} — статус {o.get('status')}, остаток {o.get('stock') if o.get('stock') is not None else '—'}")
-        except Exception as e:
-            logger.warning("YM daily report failed: %s", e)
-    if state.get("store_mon_ym", True) and ym_client.configured():
-        try:
-            ym_offers = await ym_client.fetch_offers()
-            ym_orders = await ym_client.fetch_orders(limit=100)
-            ym_recent: List[Dict[str, Any]] = []
-            for order in ym_orders:
-                created = order.get("creationDate") or order.get("createdAt") or order.get("created")
-                dt = None
-                if isinstance(created, str):
-                    try:
-                        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                    except ValueError:
-                        dt = None
-                if dt is None or dt >= since_dt:
-                    ym_recent.append(order)
-            counts: Dict[str, int] = {}
-            for offer in ym_offers:
-                st = str(offer.get("status") or "unknown")
-                counts[st] = counts.get(st, 0) + 1
-            low = [o for o in ym_offers if str(o.get("status") or "").upper() in ("NO_STOCKS", "DISABLED_BY_PARTNER") or (isinstance(o.get("stock"), int) and int(o.get("stock") or 0) <= 0)]
-            lines.append("")
-            lines.append(f"🟡 Яндекс Маркет: офферы {len(ym_offers)}, заказов за 24ч {len(ym_recent)}")
-            if counts:
-                lines.append("Статусы YM: " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
-            if low:
-                lines.append(f"Офферы без остатка/выключенные YM: {len(low)}")
-                for o in low[:8]:
-                    lines.append(f"• {str(o.get('name') or o.get('offer_id'))[:60]} — статус {o.get('status')}, остаток {o.get('stock') if o.get('stock') is not None else '—'}")
-        except Exception as e:
-            logger.warning("YM daily report failed: %s", e)
-            lines.append(f"🟡 Яндекс Маркет недоступен: {e}")
-
-    if state.get("store_mon_ym", True) and ym_client.configured():
-        try:
-            ym_offers = await ym_client.fetch_offers()
-            ym_orders = await ym_client.fetch_orders(limit=100)
-            ym_recent: List[Dict[str, Any]] = []
-            for order in ym_orders:
-                created = order.get("creationDate") or order.get("createdAt") or order.get("created")
-                dt = None
-                if isinstance(created, str):
-                    try:
-                        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                    except ValueError:
-                        dt = None
-                if dt is None or dt >= since_dt:
-                    ym_recent.append(order)
-            counts: Dict[str, int] = {}
-            for offer in ym_offers:
-                st = str(offer.get("status") or "unknown")
-                counts[st] = counts.get(st, 0) + 1
-            low = [o for o in ym_offers if str(o.get("status") or "").upper() in ("NO_STOCKS", "DISABLED_BY_PARTNER") or (isinstance(o.get("stock"), int) and int(o.get("stock") or 0) <= 0)]
-            lines.append("")
-            lines.append(f"🟡 Яндекс Маркет: офферов {len(ym_offers)}, заказов за 24ч {len(ym_recent)}")
-            if counts:
-                lines.append("Статусы YM: " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
-            if low:
-                lines.append(f"Офферы без остатка/выключенные YM: {len(low)}")
-                for o in low[:8]:
-                    lines.append(f"• {str(o.get('name') or o.get('offer_id'))[:60]} — статус {o.get('status')}, остаток {o.get('stock') if o.get('stock') is not None else '—'}")
-        except Exception as e:
-            logger.warning("YM daily report failed: %s", e)
-            lines.append(f"🟡 Яндекс Маркет недоступен: {e}")
-
-
     returns_list: List[Dict[str, Any]] = []
     returns_fetch_ok = True
     if ozon_store_enabled:
@@ -1157,7 +1057,12 @@ async def build_delivery_report(provider_key: str, days: int) -> tuple[str, Inli
             if s.extra.get("recipient_name") and s.extra.get("recipient_phone"):
                 recipient = f"{s.extra.get('recipient_name')}, {s.extra.get('recipient_phone')}"
                 lines.append(f"  Получатель: {short_text(recipient, 120)}")
-            lines.append(f"  Доставлен: {fmt_date(s.delivered_at) if s.delivered_at else '—'}")
+            delivered_label = "Выдан" if extra.get("scheme") == "FBO" else "Доставлен"
+            if s.delivered_at and extra.get("delivered_date_only"):
+                delivered_value = fmt_delivery_date(str(s.delivered_at)[:10])
+            else:
+                delivered_value = fmt_date(s.delivered_at) if s.delivered_at else "—"
+            lines.append(f"  {delivered_label}: {delivered_value}")
         if len(delivered) > 8:
             lines.append(f"… и ещё {len(delivered) - 8} доставлено")
 
@@ -1343,6 +1248,23 @@ async def post_init(application: Application) -> None:
     await load_state()
     task = asyncio.create_task(periodic_loop(application))
     application.bot_data["background_task"] = task
+    # Let Telegram finish the startup handshake before the first check, so a
+    # slow Ozon report cannot make the bot look hung on launch.
+    asyncio.create_task(startup_check(application))
+
+
+async def startup_check(application: Application) -> None:
+    await asyncio.sleep(5)
+    state = await load_state()
+    if state.get("monitoring_enabled", True):
+        try:
+            await run_price_check(application)
+        except Exception as e:
+            logger.warning("Startup price check failed: %s", e)
+        try:
+            await check_delivery_alerts(application)
+        except Exception as e:
+            logger.warning("Startup delivery check failed: %s", e)
 
 
 async def post_shutdown(application: Application) -> None:
@@ -1520,7 +1442,7 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             state["ym_offers_initialized"] = bool(ym_offers_list)
             ym_offer_count = len(ym_offers_list)
         except Exception as e:
-            await send_to_admins(application, f"YM sync failed: {e}")
+            await send_to_admins(context.application, f"YM sync failed: {e}")
             ym_offer_count = 0
 
     ref_ids = {r["product_id"] for r in refs}
@@ -2343,11 +2265,33 @@ async def cmd_orders(update, context):
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     to = now_iso()
     try:
-        posts = await ozon.fetch_postings_fbs(since, to, 50) + await ozon.fetch_postings_fbo(since, to, 50)
+        posts_fbs = await ozon.fetch_postings_fbs(since, to, 50)
+        posts_fbo = await ozon.fetch_postings_fbo(since, to, 50)
     except OzonError as e:
         await update.message.reply_text('Ошибка Ozon: ' + str(e), reply_markup=inline_main_kb())
         return
-        await update.message.reply_text('Заказов за ' + str(days) + ' дней не найдено.', reply_markup=inline_main_kb())
+    posts = posts_fbs + posts_fbo
+    # FBO list has no issue date; fetch it for delivered postings so the
+    # "Выдан" status is not left without a timestamp.
+    fbo_issued = {}
+    fbo_delivered = [
+        str(p.get('posting_number'))
+        for p in posts_fbo
+        if isinstance(p, dict)
+        and p.get('posting_number')
+        and str(p.get('status') or '').lower() in ('delivered', 'posting_received')
+    ][:20]
+    if fbo_delivered:
+        sem = asyncio.Semaphore(5)
+
+        async def _fbo_issued(number):
+            async with sem:
+                detail = await ozon.fetch_posting_fbo(number)
+            return number, detail.get('fact_delivery_date')
+
+        for number, value in await asyncio.gather(*(_fbo_issued(n) for n in fbo_delivered)):
+            if value:
+                fbo_issued[number] = value
     posts = sorted(posts, key=lambda p: p.get('created_at') or p.get('in_process_at') or '', reverse=True)
     lines = ['Заказы Ozon за ' + str(days) + ' дней (' + str(len(posts)) + '):']
     for p in posts[:20]:
@@ -2375,6 +2319,8 @@ async def cmd_orders(update, context):
         price_str = str(price) if price not in (None, '') else '-'
         lines.append('Кол-во/цена: ' + qty_str + ' x ' + price_str + ' RUB')
         lines.append('Создан: ' + str(created))
+        if scheme == 'FBO' and str(pn) in fbo_issued:
+            lines.append('Выдан: ' + fmt_date(fbo_issued[str(pn)]))
     state = await load_state()
     if state.get("store_mon_ym", True) and ym_client.configured():
         try:

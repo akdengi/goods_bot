@@ -13,13 +13,14 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urljoin
 
 import httpx
 
 logger = logging.getLogger(__name__)
+MSK_TZ = timezone(timedelta(hours=3))
 
 
 class ShippingError(Exception):
@@ -129,6 +130,44 @@ class OzonDeliveryProvider(DeliveryProvider):
         except Exception as e:
             raise ShippingError(f"Ozon: {e}") from e
 
+        # Ozon's list endpoints do not return the customer delivery timestamp.
+        # `delivering_date` is the hand-over-to-delivery date, not delivery to
+        # the buyer, so using it produced dates that were days too early.
+        # For FBS the delivery date can be recovered from the status-change
+        # filter; for FBO the posting details expose fact_delivery_date.
+        fbs_delivery_dates: Dict[str, str] = {}
+        fbs_has_delivered = any(
+            isinstance(p, dict)
+            and str(p.get("status") or "").lower() in ("delivered", "posting_received")
+            for p in (fbs or [])
+        )
+        if fbs_has_delivered:
+            try:
+                fbs_delivery_dates = await self.ozon.fetch_fbs_delivered_dates(
+                    since.isoformat(), to.isoformat()
+                )
+            except Exception as e:
+                logger.warning("Ozon FBS delivery dates failed: %s", e)
+        fbo_delivery_dates: Dict[str, str] = {}
+        fbo_delivered = [
+            str(p.get("posting_number"))
+            for p in (fbo or [])
+            if isinstance(p, dict)
+            and str(p.get("status") or "").lower() in ("delivered", "posting_received")
+            and p.get("posting_number")
+        ][:50]
+        if fbo_delivered:
+            sem = asyncio.Semaphore(5)
+
+            async def fbo_date(number: str):
+                async with sem:
+                    data = await self.ozon.fetch_posting_fbo(number)
+                return number, (data or {}).get("fact_delivery_date")
+
+            for number, value in await asyncio.gather(*(fbo_date(n) for n in fbo_delivered)):
+                if value:
+                    fbo_delivery_dates[number] = value
+
         result: List[Shipment] = []
         ozon_rows = [(posting, "FBS") for posting in (fbs or []) if isinstance(posting, dict)]
         ozon_rows += [(posting, "FBO") for posting in (fbo or []) if isinstance(posting, dict)]
@@ -161,9 +200,17 @@ class OzonDeliveryProvider(DeliveryProvider):
                 and any(word in (status_raw + " " + substatus) for word in ("pickup", "ready_for_pickup", "pvz"))
             )
             expected = analytics.get("delivery_date_begin") or analytics.get("delivery_date_end") or posting.get("delivering_date")
+            shipment_id = str(posting.get("posting_number") or posting.get("order_number") or "—")
             delivered_at = None
+            delivered_date_only = False
             if delivered:
-                delivered_at = posting.get("delivering_date") or analytics.get("delivery_date_end") or analytics.get("delivery_date_begin")
+                if scheme == "FBS":
+                    day = fbs_delivery_dates.get(shipment_id)
+                    if day:
+                        delivered_at = f"{day}T00:00:00+03:00"
+                        delivered_date_only = True
+                else:
+                    delivered_at = fbo_delivery_dates.get(shipment_id)
             destination = analytics.get("city") or posting.get("destination_place_name") or analytics.get("region")
             if not destination:
                 fin = posting.get("financial_data") if isinstance(posting.get("financial_data"), dict) else {}
@@ -171,7 +218,7 @@ class OzonDeliveryProvider(DeliveryProvider):
             result.append(
                 Shipment(
                     provider=self.key,
-                    shipment_id=str(posting.get("posting_number") or posting.get("order_number") or "—"),
+                    shipment_id=shipment_id,
                     status=str(status),
                     created_at=posting.get("in_process_at") or posting.get("created_at"),
                     expected_at=expected,
@@ -185,7 +232,12 @@ class OzonDeliveryProvider(DeliveryProvider):
                     status_code=substatus or status_raw,
                     is_delivered=delivered,
                     is_cancelled=cancelled,
-                    extra={"scheme": scheme, "raw_status": status_raw, "substatus": substatus},
+                    extra={
+                        "scheme": scheme,
+                        "raw_status": status_raw,
+                        "substatus": substatus,
+                        "delivered_date_only": delivered_date_only,
+                    },
                 )
             )
         return result[:limit]
@@ -766,7 +818,7 @@ YANDEX_OTHER_STATUS_LABELS = {
 def fmt_yandex_dt(value: Any) -> str:
     dt = parse_dt(value)
     if dt is not None:
-        return dt.astimezone().strftime("%d.%m.%Y %H:%M")
+        return dt.astimezone(MSK_TZ).strftime("%d.%m.%Y %H:%M")
     return str(value)
 
 

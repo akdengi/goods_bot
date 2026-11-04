@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 import httpx
@@ -499,3 +502,119 @@ class OzonClient:
             return []
         posts = data.get("postings", [])
         return posts if isinstance(posts, list) else []
+
+    async def fetch_posting_fbo(self, posting_number: str) -> Dict[str, Any]:
+        """Fetch one FBO posting including its fact_delivery_date."""
+        try:
+            data = await self._request(
+                "/v2/posting/fbo/get",
+                {
+                    "posting_number": str(posting_number),
+                    "with": {"analytics_data": True, "financial_data": True},
+                },
+            )
+        except OzonError as e:
+            logger.warning("fetch_posting_fbo(%s) failed: %s", posting_number, e)
+            return {}
+        result = data.get("result") if isinstance(data, dict) else None
+        return result if isinstance(result, dict) else {}
+
+    async def fetch_fbs_delivered_dates(self, dt_from: str, dt_to: str) -> Dict[str, str]:
+        """Return posting_number -> Moscow date when an FBS posting became delivered.
+
+        Ozon's posting list has no delivered-at timestamp.  The only reliable
+        source is the ``last_changed_status_date`` filter: for a posting whose
+        current status is ``delivered`` this is the moment it was actually
+        received by the buyer.  Query it day by day so each posting gets its
+        own date instead of the seller hand-over date.
+        """
+        msk = timezone(timedelta(hours=3))
+
+        def parse(value: str) -> Optional[datetime]:
+            try:
+                s = str(value).strip().replace("Z", "+00:00")
+                if len(s) >= 5 and s[-5] in "+-" and s[-3] != ":":
+                    s = s[:-2] + ":" + s[-2:]
+                dt = datetime.fromisoformat(s)
+            except (TypeError, ValueError):
+                return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+
+        start = parse(dt_from)
+        end = parse(dt_to)
+        if start is None or end is None or start >= end:
+            return {}
+
+        start_local = start.astimezone(msk)
+        end_local = end.astimezone(msk)
+        day = start_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        days = []
+        while day <= end_local:
+            days.append(day)
+            day += timedelta(days=1)
+
+        sem = asyncio.Semaphore(5)
+
+        async def one_day(day_start: datetime) -> Dict[str, str]:
+            day_end = day_start + timedelta(days=1)
+            query_from = max(day_start, start_local).astimezone(timezone.utc)
+            query_to = min(day_end, end_local).astimezone(timezone.utc)
+            day_key = day_start.date().isoformat()
+            cache_key = f"{day_key}|{query_from.isoformat()}|{query_to.isoformat()}"
+            cache = self.__dict__.setdefault("_fbs_delivery_day_cache", {})
+            cached = cache.get(cache_key)
+            ttl = 120 if day_start.date() == datetime.now(msk).date() else 3600
+            if cached and time.monotonic() - cached[0] < ttl:
+                return dict(cached[1])
+            mapping: Dict[str, str] = {}
+            offset = 0
+            failed = False
+            async with sem:
+                while offset < 1000:
+                    try:
+                        data = await self._request(
+                            "/v4/posting/fbs/list",
+                            {
+                                "dir": "DESC",
+                                "filter": {
+                                    "since": dt_from,
+                                    "to": dt_to,
+                                    "status": "delivered",
+                                    "last_changed_status_date": {
+                                        "from": query_from.isoformat(),
+                                        "to": query_to.isoformat(),
+                                    },
+                                },
+                                "limit": 100,
+                                "offset": offset,
+                                "with": {"analytics_data": False, "financial_data": False},
+                            },
+                        )
+                    except OzonError as e:
+                        logger.warning("fetch_fbs_delivered_dates(%s) failed: %s", day_start.date(), e)
+                        failed = True
+                        break
+                    posts = data.get("postings", []) if isinstance(data, dict) else []
+                    if not isinstance(posts, list) or not posts:
+                        break
+                    for posting in posts:
+                        if not isinstance(posting, dict):
+                            continue
+                        number = posting.get("posting_number")
+                        if number:
+                            mapping[str(number)] = day_start.date().isoformat()
+                    if len(posts) < 100:
+                        break
+                    offset += len(posts)
+            if not failed:
+                cache[cache_key] = (time.monotonic(), dict(mapping))
+            return mapping
+
+        results = await asyncio.gather(*(one_day(d) for d in days), return_exceptions=True)
+        delivered: Dict[str, str] = {}
+        for item in results:
+            if isinstance(item, dict):
+                delivered.update(item)
+        return delivered
