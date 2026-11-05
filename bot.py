@@ -26,6 +26,9 @@ OZON_API_KEY = os.getenv("OZON_API_KEY", "").strip()
 YANDEX_MARKET_TOKEN = os.getenv("YANDEX_MARKET_API_KEY", "").strip() or os.getenv("YANDEX_MARKET_TOKEN", "").strip()
 YANDEX_MARKET_CAMPAIGN_ID_RAW = os.getenv("YANDEX_MARKET_CAMPAIGN_ID", "").strip()
 YANDEX_DELIVERY_TOKEN = os.getenv("YANDEX_DELIVERY_TOKEN", "").strip()
+TILDA_PROJECT_ID = os.getenv("TILDA_PROJECT_ID", "").strip()
+TILDA_MCP_TOKEN = os.getenv("TILDA_MCP_TOKEN", "").strip()
+TILDA_MCP_URL = os.getenv("TILDA_MCP_URL", "").strip() or "https://tilda.ru/api/mcp/"
 CDEK_ACCOUNT = (os.getenv("CDEK_ACCOUNT", "") or os.getenv("CDEK_CLIENT_ID", "")).strip()
 CDEK_SECURE_PASSWORD = (os.getenv("CDEK_SECURE_PASSWORD", "") or os.getenv("CDEK_CLIENT_SECRET", "")).strip()
 CDEK_V1_URL = os.getenv("CDEK_V1_URL", "https://integration.cdek.ru").strip() or "https://integration.cdek.ru"
@@ -43,6 +46,8 @@ sys.path.insert(0, str(BASE_DIR))
 from ozon import OzonClient, OzonError  # noqa: E402
 from yandex_market import YandexMarketClient, YandexMarketError  # noqa: E402
 from shipping import ShippingError, build_shipping_service, parse_dt  # noqa: E402
+from tilda import TildaClient, TildaError  # noqa: E402
+import tilda_site  # noqa: E402
 from storage import Storage  # noqa: E402
 
 logging.basicConfig(
@@ -58,6 +63,7 @@ try:
 except (TypeError, ValueError):
     yandex_market_campaign_id = None
 ym_client = YandexMarketClient(YANDEX_MARKET_TOKEN, yandex_market_campaign_id)
+tilda_client = TildaClient(TILDA_PROJECT_ID, TILDA_MCP_TOKEN, TILDA_MCP_URL)
 shipping = build_shipping_service(
     ozon_client=ozon,
     yandex_token=YANDEX_DELIVERY_TOKEN,
@@ -789,6 +795,14 @@ async def send_daily_report(application: Application) -> None:
             logger.warning("YM daily report failed: %s", e)
             lines.append(f"🟡 Яндекс Маркет недоступен: {e}")
 
+    if state.get("store_mon_tilda", True) and tilda_client.configured():
+        try:
+            tilda_recent = await tilda_client.fetch_orders(3)
+            lines.extend(tilda_site.format_daily_block(tilda_recent, since_dt))
+        except TildaError as e:
+            logger.warning("Tilda daily report failed: %s", e)
+            lines.append(f"🟣 Тильда недоступна: {e}")
+
     if returns_list:
         lines.append(f"↩️ Возвраты за 24ч ({len(returns_list)}):")
         for r in returns_list[:10]:
@@ -1104,6 +1118,8 @@ def format_delivery_alert(shipment, events: List[str], warn_hours: int) -> str:
         labels.append("истекает срок хранения")
     if "courier" in events:
         labels.append("выдана курьеру")
+    if "status" in events:
+        labels.append("новый статус: " + str(shipment.status))
     if "delivered" in events:
         labels.append("доставлена")
     if labels:
@@ -1142,6 +1158,7 @@ async def check_delivery_alerts(application: Application) -> None:
     if not items:
         return
     alerted = state.setdefault("delivery_alerts", {})
+    yandex_seen = state.setdefault("yandex_status_seen", {})
     changed = False
     today_key = datetime.now().astimezone().date().isoformat()
     for shipment in items:
@@ -1174,6 +1191,17 @@ async def check_delivery_alerts(application: Application) -> None:
             key = f"{shipment.key}:courier"
             if key not in alerted:
                 events.append("courier")
+        if shipment.provider == "yandex" and (not is_delivered) and status_raw not in courier_statuses:
+            prev_status = yandex_seen.get(shipment.key)
+            if prev_status is not None and prev_status != status_raw:
+                key = f"{shipment.key}:status:{status_raw}"
+                if key not in alerted:
+                    events.append("status")
+                yandex_seen[shipment.key] = status_raw
+                changed = True
+            elif prev_status is None:
+                yandex_seen[shipment.key] = status_raw
+                changed = True
         delivered_dt = parse_dt(shipment.delivered_at)
         if is_delivered and delivered_dt is not None and delivered_dt >= now - timedelta(hours=24):
             key = f"{shipment.key}:delivered"
@@ -1191,6 +1219,8 @@ async def check_delivery_alerts(application: Application) -> None:
                 alerted[f"{shipment.key}:courier"] = now.isoformat()
             elif event == "delivered":
                 alerted[f"{shipment.key}:delivered"] = now.isoformat()
+            elif event == "status":
+                alerted[f"{shipment.key}:status:{status_raw}"] = now.isoformat()
         changed = True
     cutoff = (now - timedelta(days=60)).isoformat()
     for key in list(alerted.keys()):
@@ -1199,6 +1229,45 @@ async def check_delivery_alerts(application: Application) -> None:
             changed = True
     if changed:
         await storage.save(state)
+
+
+async def check_tilda_alerts(application: Application) -> None:
+    """Push о новых оплаченных заказах на сайте Тильды (только чтение)."""
+    state = await load_state()
+    if not state.get("store_mon_tilda", True) or not tilda_client.configured():
+        return
+    try:
+        orders = await tilda_client.fetch_orders(15)
+    except TildaError as e:
+        logger.warning("Tilda alert check failed: %s", e)
+        return
+    now = datetime.now(timezone.utc)
+    seen = state.setdefault("tilda_seen_orders", {})
+    initialized = bool(state.get("tilda_orders_initialized"))
+    changed = False
+    fresh = []
+    for order in orders:
+        if not order.paid or order.paid_at is None:
+            continue
+        key = order.number
+        if not key or key in seen:
+            continue
+        seen[key] = order.paid_at.isoformat()
+        changed = True
+        if initialized and order.paid_at >= now - timedelta(hours=48):
+            fresh.append(order)
+    if not initialized:
+        state["tilda_orders_initialized"] = True
+        changed = True
+    cutoff = (now - timedelta(days=60)).isoformat()
+    for key in list(seen.keys()):
+        if str(seen[key]) < cutoff:
+            del seen[key]
+            changed = True
+    if changed:
+        await storage.save(state)
+    for order in sorted(fresh, key=lambda o: o.paid_at or now):
+        await send_to_admins(application, tilda_site.format_new_paid_alert(order))
 
 
 async def periodic_loop(application: Application) -> None:
@@ -1221,6 +1290,12 @@ async def periodic_loop(application: Application) -> None:
                 raise
             except Exception as e:
                 logger.exception("Periodic delivery alerts failed: %s", e)
+            try:
+                await check_tilda_alerts(application)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.exception("Periodic Tilda alerts failed: %s", e)
             try:
                 st = await load_state()
                 now_local = datetime.now()
@@ -1265,6 +1340,10 @@ async def startup_check(application: Application) -> None:
             await check_delivery_alerts(application)
         except Exception as e:
             logger.warning("Startup delivery check failed: %s", e)
+        try:
+            await check_tilda_alerts(application)
+        except Exception as e:
+            logger.warning("Startup Tilda check failed: %s", e)
 
 
 async def post_shutdown(application: Application) -> None:
@@ -1727,10 +1806,12 @@ def settings_main_kb(state: Dict[str, Any]) -> InlineKeyboardMarkup:
     stock_mon = bool(state.get("stock_monitoring_enabled", True))
     store_ozon_mon = bool(state.get("store_mon_ozon", True))
     store_ym_mon = bool(state.get("store_mon_ym", True))
+    store_tilda_mon = bool(state.get("store_mon_tilda", True))
     thr = fmt_money(state.get("threshold", THRESHOLD_RUB))
     interval = int(state.get("check_interval", CHECK_INTERVAL_SEC)) // 60
     report = state.get("report_hour_local", 10)
     orders = state.get("orders_days", 3)
+    tilda_orders = state.get("tilda_orders_days", 15)
     stock = state.get("stock_threshold", STOCK_ALERT_THRESHOLD)
     warn = state.get("delivery_warn_hours", DELIVERY_STORAGE_WARN_HOURS)
     return InlineKeyboardMarkup(
@@ -1744,6 +1825,8 @@ def settings_main_kb(state: Dict[str, Any]) -> InlineKeyboardMarkup:
             [InlineKeyboardButton((("🟢 ⏸ Выключить мониторинг остатков" if stock_mon else "🔴 ▶️ Включить мониторинг остатков")), callback_data="stockmonitor_toggle")],
             [InlineKeyboardButton((("🟢 ⏸ Ozon мониторинг" if store_ozon_mon else "🔴 ▶️ Ozon мониторинг")), callback_data="storemonitor_ozon")],
             [InlineKeyboardButton((("🟢 ⏸ ЯМ мониторинг" if store_ym_mon else "🔴 ▶️ ЯМ мониторинг")), callback_data="storemonitor_ym")],
+            [InlineKeyboardButton((("🟢 ⏸ Тильда мониторинг" if store_tilda_mon else "🔴 ▶️ Тильда мониторинг")), callback_data="storemonitor_tilda")],
+            [InlineKeyboardButton(f"🟣 Тильда: {tilda_orders} дн", callback_data="set_page:tilda")],
             [InlineKeyboardButton((("🟢 ⏸ Выключить мониторинг" if mon else "🔴 ▶️ Включить мониторинг")), callback_data="monitor_toggle")],
             [InlineKeyboardButton("🏠 Главное меню", callback_data="help_now")],
         ]
@@ -1769,6 +1852,9 @@ def settings_page_kb(page: str, state: Dict[str, Any]) -> InlineKeyboardMarkup:
     elif page == "storage":
         title, values = "Предупреждать о сроке хранения", [6, 12, 24, 48, 72]
         cb, cur = "setwarn", state.get("delivery_warn_hours", DELIVERY_STORAGE_WARN_HOURS)
+    elif page == "tilda":
+        title, values = "Окно заказов Тильды", [15, 30]
+        cb, cur = "settilda", state.get("tilda_orders_days", 15)
     else:
         return settings_main_kb(state)
     rows = []
@@ -1791,10 +1877,12 @@ def settings_page_text(page: str, state: Dict[str, Any]) -> str:
     stock_mon = "включён" if state.get("stock_monitoring_enabled", True) else "выключен"
     store_ozon_mon = "включён" if state.get("store_mon_ozon", True) else "выключен"
     store_ym_mon = "включён" if state.get("store_mon_ym", True) else "выключен"
+    store_tilda_mon = "включён" if state.get("store_mon_tilda", True) else "выключен"
     thr = fmt_money(state.get("threshold", THRESHOLD_RUB))
     interval = int(state.get("check_interval", CHECK_INTERVAL_SEC)) // 60
     report = state.get("report_hour_local", 10)
     orders = state.get("orders_days", 3)
+    tilda_orders = state.get("tilda_orders_days", 15)
     stock = state.get("stock_threshold", STOCK_ALERT_THRESHOLD)
     warn = state.get("delivery_warn_hours", DELIVERY_STORAGE_WARN_HOURS)
     if page == "price":
@@ -1813,16 +1901,20 @@ def settings_page_text(page: str, state: Dict[str, Any]) -> str:
             "Бот пришлёт сообщение, когда посылка в ПВЗ и срок хранения подходит к концу. "
             "Выберите, за сколько часов предупреждать:"
         )
+    if page == "tilda":
+        return f"🟣 Окно заказов Тильды\nСейчас: {tilda_orders} дн\n\nВыберите значение:"
     return (
         "⚙️ Настройки\n"
         f"Мониторинг: {mon}\n"
         f"Мониторинг остатков: {stock_mon}\n"
         f"Ozon мониторинг: {store_ozon_mon}\n"
         f"Яндекс Маркет мониторинг: {store_ym_mon}\n"
+        f"Тильда мониторинг: {store_tilda_mon}\n"
         f"Порог цены: {thr} ₽\n"
         f"Порог остатков: {stock} шт\n"
         f"Интервал проверки: {interval} мин\n"
         f"Окно заказов: {orders} дн\n"
+        f"Окно заказов Тильды: {tilda_orders} дн\n"
         f"Время отчёта: {report}:00 (серверное)\n"
         f"Предупреждение о хранении: за {warn} ч\n"
         f"Серверное время: {now} (Europe/Helsinki, UTC+2)\n"
@@ -1908,6 +2000,16 @@ async def build_list_view(offset: int):
                     lines.append(f"• {str(offer.get('name') or offer.get('offer_id'))[:60]} — {offer.get('status') or '—'}, {fmt_money(offer.get('basic_price'))} ₽{stock_txt}")
         except Exception as e:
             lines.append(f"YM offers unavailable: {e}")
+
+    state = await load_state()
+    if state.get("store_mon_tilda", True) and tilda_client.configured():
+        try:
+            tilda_products = await tilda_client.fetch_products()
+            lines.extend(tilda_site.format_products_block(tilda_products))
+        except TildaError as e:
+            logger.warning("Tilda products failed: %s", e)
+            lines.append("")
+            lines.append(f"🟣 Тильда недоступна: {e}")
 
     kb = InlineKeyboardMarkup(buttons)
     return "\n".join(lines), kb
@@ -2017,6 +2119,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await storage.save(state)
         await show_settings_page(query.message, "main", edit=True)
         return
+    if data == "storemonitor_tilda":
+        state = await load_state()
+        if query.from_user.id not in state.get("admins", []):
+            return
+        state["store_mon_tilda"] = not bool(state.get("store_mon_tilda", True))
+        await storage.save(state)
+        await show_settings_page(query.message, "main", edit=True)
+        return
     if data == "stockmonitor_toggle":
         state = await load_state()
         if query.from_user.id not in state.get("admins", []):
@@ -2114,6 +2224,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         state["delivery_warn_hours"] = val
         await storage.save(state)
         await show_settings_page(query.message, "storage", edit=True)
+        return
+    if data.startswith("settilda:"):
+        state = await load_state()
+        if query.from_user.id not in state.get("admins", []):
+            return
+        try:
+            val = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            return
+        if val not in (15, 30):
+            return
+        state["tilda_orders_days"] = val
+        await storage.save(state)
+        await show_settings_page(query.message, "tilda", edit=True)
         return
     if data in ("sync_now", "sync"):
         msg = await query.message.reply_text("⏳ Синхронизирую…")
@@ -2249,6 +2373,16 @@ async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         except Exception as e:
             lines.append(f"YM prices unavailable: {e}")
 
+    state = await load_state()
+    if state.get("store_mon_tilda", True) and tilda_client.configured():
+        try:
+            tilda_products = await tilda_client.fetch_products()
+            lines.extend(tilda_site.format_prices_block(tilda_products))
+        except TildaError as e:
+            logger.warning("Tilda prices failed: %s", e)
+            lines.append("")
+            lines.append(f"🟣 Тильда недоступна: {e}")
+
     await update.message.reply_text("\n".join(lines).strip(), reply_markup=inline_main_kb())
 
 async def cmd_orders(update, context):
@@ -2338,6 +2472,16 @@ async def cmd_orders(update, context):
                 if created:
                     lines.append(f"  Создан: {fmt_date(created)}")
 
+    tilda_days = int(state.get("tilda_orders_days", 15) or 15)
+    if state.get("store_mon_tilda", True) and tilda_client.configured():
+        try:
+            tilda_orders = await tilda_client.fetch_orders(tilda_days)
+            lines.extend(tilda_site.format_orders_block(tilda_orders, tilda_days))
+        except TildaError as e:
+            logger.warning("Tilda orders failed: %s", e)
+            lines.append("")
+            lines.append(f"🟣 Тильда недоступна: {e}")
+
     await update.message.reply_text(chr(10).join(lines), reply_markup=inline_main_kb())
     try:
         state = await load_state()
@@ -2345,6 +2489,56 @@ async def cmd_orders(update, context):
         await storage.save(state)
     except Exception:
         pass
+
+
+async def cmd_tilda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _admin_guard(update):
+        return
+    state = await load_state()
+    days = int(state.get("tilda_orders_days", 15) or 15)
+    if context.args:
+        try:
+            value = int(context.args[0])
+        except (ValueError, IndexError):
+            value = days
+        if value in (15, 30):
+            days = value
+    try:
+        products = await tilda_client.fetch_products()
+        orders = await tilda_client.fetch_orders(days)
+    except TildaError as e:
+        await update.message.reply_text(f"❌ Ошибка Тильды: {e}", reply_markup=inline_main_kb())
+        return
+    lines = [f"🟣 Тильда: товаров в продаже {len(products)}"]
+    lines.extend(tilda_site.format_prices_block(products))
+    lines.extend(tilda_site.format_orders_block(orders, days))
+    await update.message.reply_text("\n".join(lines).strip(), reply_markup=inline_main_kb())
+
+
+async def cmd_tildaset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _admin_guard(update):
+        return
+    state = await load_state()
+    if not context.args:
+        cur = state.get("tilda_orders_days", 15)
+        await update.message.reply_text(
+            f"Окно заказов Тильды: {cur} дн.\nИспользование: /tildaset 30   (15 или 30)",
+            reply_markup=inline_main_kb(),
+        )
+        return
+    try:
+        days = int(context.args[0])
+    except (ValueError, IndexError):
+        await update.message.reply_text("Укажите 15 или 30, например /tildaset 30", reply_markup=inline_main_kb())
+        return
+    if days not in (15, 30):
+        await update.message.reply_text("Допустимые значения: 15 или 30 дней.", reply_markup=inline_main_kb())
+        return
+    state["tilda_orders_days"] = days
+    await storage.save(state)
+    await update.message.reply_text(f"✅ Окно заказов Тильды: {days} дн.", reply_markup=inline_main_kb())
+
+
 async def cmd_setinterval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _admin_guard(update):
         return
@@ -2645,6 +2839,8 @@ def main() -> None:
     app.add_handler(CommandHandler("shipping", cmd_deliveries))
     app.add_handler(CommandHandler("ym", cmd_ym))
     app.add_handler(CommandHandler("yandexmarket", cmd_ym))
+    app.add_handler(CommandHandler("tilda", cmd_tilda))
+    app.add_handler(CommandHandler("tildaset", cmd_tildaset))
     app.add_handler(CommandHandler("returnstats", cmd_returnstats))
     app.add_handler(CommandHandler("order", cmd_orders))
     app.add_handler(CommandHandler("reviews", cmd_reviews))

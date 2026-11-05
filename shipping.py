@@ -277,144 +277,6 @@ YANDEX_STATUS_LABELS = {
 }
 
 
-class YandexDeliveryProvider(DeliveryProvider):
-    key = "yandex"
-    title = "Яндекс Доставка"
-    emoji = "🟡"
-    BASE_URL = "https://b2b.taxi.yandex.net"
-
-    def __init__(self, token: str):
-        self.token = (token or "").strip()
-
-    def configured(self) -> bool:
-        return bool(self.token)
-
-    async def fetch(self, since: datetime, to: datetime, limit: int = 200) -> List[Shipment]:
-        if not self.configured():
-            raise ShippingError("Яндекс Доставка не настроена: заполните YANDEX_DELIVERY_TOKEN")
-        payload = {
-            "limit": max(1, min(int(limit), 1000)),
-            "offset": 0,
-            "created_from": since.isoformat(),
-            "created_to": to.isoformat(),
-        }
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Accept-Language": "ru",
-            "Content-Type": "application/json",
-        }
-        try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(
-                    self.BASE_URL + "/b2b/cargo/integration/v2/claims/search",
-                    headers=headers,
-                    json=payload,
-                )
-        except httpx.HTTPError as e:
-            raise ShippingError(f"Яндекс Доставка: сетевая ошибка: {e}") from e
-        if resp.status_code >= 400:
-            raise ShippingError(f"Яндекс Доставка: HTTP {resp.status_code}: {resp.text[:300]}")
-        try:
-            data = resp.json()
-        except ValueError as e:
-            raise ShippingError("Яндекс Доставка: некорректный ответ API") from e
-        claims = data.get("claims") if isinstance(data, dict) else None
-        if not isinstance(claims, list):
-            return []
-
-        result: List[Shipment] = []
-        for claim in claims:
-            if not isinstance(claim, dict):
-                continue
-            status_raw = str(claim.get("status") or "").lower()
-            status = YANDEX_STATUS_LABELS.get(status_raw, status_raw or "—")
-            delivered = status_raw in ("delivered", "delivered_finish")
-            cancelled = status_raw.startswith("cancelled") or status_raw in ("failed", "returned", "returned_finish")
-            items = claim.get("items") if isinstance(claim.get("items"), list) else []
-            qty = 0
-            names: List[str] = []
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    qty += int(item.get("quantity") or 1)
-                except (TypeError, ValueError):
-                    qty += 1
-                title = item.get("title")
-                if title:
-                    names.append(str(title))
-            product = " / ".join(names[:2]) + ("…" if len(names) > 2 else "") if names else None
-
-            destination = None
-            destination_addr = None
-            pickup_ready_at = None
-            expected = claim.get("due")
-            delivered_at = None
-            route_points = claim.get("route_points") if isinstance(claim.get("route_points"), list) else []
-            for point in route_points:
-                if not isinstance(point, dict) or point.get("type") != "destination":
-                    continue
-                addr = point.get("address") if isinstance(point.get("address"), dict) else {}
-                destination = addr.get("fullname") or addr.get("shortname") or destination
-                destination_addr = destination
-                interval = point.get("expected_visit_interval") if isinstance(point.get("expected_visit_interval"), dict) else {}
-                expected = expected or interval.get("to") or interval.get("from")
-                visited = point.get("visited_at") if isinstance(point.get("visited_at"), dict) else {}
-                delivered_at = visited.get("actual") or visited.get("expected") or delivered_at
-                # Yandex express is courier delivery, not a PVZ handover. Do not
-                # treat "delivery_arrived" as PVZ-ready.
-            if delivered and not delivered_at:
-                delivered_at = claim.get("updated_ts")
-
-            performer = claim.get("performer_info") if isinstance(claim.get("performer_info"), dict) else {}
-            result.append(
-                Shipment(
-                    provider=self.key,
-                    shipment_id=str(claim.get("id") or "—"),
-                    status=str(status),
-                    created_at=claim.get("created_ts"),
-                    expected_at=expected,
-                    delivered_at=delivered_at,
-                    pickup_ready_at=pickup_ready_at,
-                    product=product,
-                    quantity=qty or None,
-                    destination=destination_addr,
-                    pickup_point=None,
-                    tracking=str(claim.get("shipping_document") or claim.get("id") or ""),
-                    status_code=status_raw,
-                    is_delivered=delivered,
-                    is_cancelled=cancelled,
-                    extra={"performer": performer, "raw_status": status_raw},
-                )
-            )
-        return result[:limit]
-
-
-# ---------------------------------------------------------------------------
-# CDEK
-# ---------------------------------------------------------------------------
-
-CDEK_STATUS_LABELS = {
-    "CREATED": "Создан",
-    "ACCEPTED": "Принят",
-    "RECEIVED_AT_SHIPMENT_WAREHOUSE": "Принят на склад отправителя",
-    "READY_FOR_SHIPMENT_IN_SENDER_CITY": "Готов к отправке",
-    "TAKEN_BY_TRANSPORTER_FROM_SENDER_CITY": "Сдан перевозчику",
-    "SENT_TO_TRANSIT_CITY": "Отправлен в транзитный город",
-    "ACCEPTED_IN_TRANSIT_CITY": "Встречен в транзитном городе",
-    "ACCEPTED_AT_TRANSIT_WAREHOUSE": "Принят на склад транзита",
-    "READY_FOR_SHIPMENT_IN_TRANSIT_CITY": "Выдан на отправку в транзите",
-    "TAKEN_BY_TRANSPORTER_FROM_TRANSIT_CITY": "Сдан перевозчику в транзите",
-    "SENT_TO_RECIPIENT_CITY": "Отправлен в город получателя",
-    "ACCEPTED_IN_RECIPIENT_CITY": "Встречен в городе получателя",
-    "ACCEPTED_AT_PICK_UP_POINT": "Готов к выдаче в ПВЗ",
-    "DELIVERED": "Доставлен",
-    "NOT_DELIVERED": "Не доставлен",
-    "RETURNED_TO_SENDER_WAREHOUSE": "Возвращён на склад отправителя",
-    "RETURNED_TO_SENDER": "Возвращён отправителю",
-}
-
-
 class CdekDeliveryProvider(DeliveryProvider):
     key = "cdek"
     title = "СДЭК"
@@ -793,8 +655,9 @@ YANDEX_OTHER_STATUS_LABELS = {
     "DELIVERY_PROCESSING_STARTED": "Создаётся в сортировочном центре",
     "SORTING_CENTER_LOADED": "Подтверждён в сортировочном центре",
     "SORTING_CENTER_AT_START": "Поступил в точку приёма",
-    "SORTING_CENTER_PREPARED": "Готов к отправке",
-    "SORTING_CENTER_TRANSMITTED": "Доставляется",
+    "IN_TRANSIT": "В пути",
+    "SORTING_CENTER_PREPARED": "Готов к передаче в службу доставки",
+    "SORTING_CENTER_TRANSMITTED": "Передан в службу доставки",
     "DELIVERY_AT_START": "Готовится к отправке получателю",
     "DELIVERY_AT_START_SORT": "Готовится к отправке получателю",
     "DELIVERY_TRANSPORTATION_RECIPIENT": "Выдан курьеру",
@@ -929,7 +792,7 @@ class YandexDeliveryProvider(DeliveryProvider):
             status = YANDEX_OTHER_STATUS_LABELS.get(status_raw, status_raw or "—")
             delivered = status_raw in ("DELIVERY_DELIVERED", "DELIVERY_TRANSMITTED_TO_RECIPIENT", "PARTICULARLY_DELIVERED")
             cancelled = status_raw == "CANCELLED" or status_raw.startswith("RETURN_")
-            pickup_ready = status_raw == "DELIVERY_ARRIVED_PICKUP_POINT"
+            pickup_ready = status_raw.startswith("DELIVERY_ARRIVED_PICKUP_POINT")
 
             request_id = str(req.get("request_id") or "—")
             operator_id = str(info.get("operator_request_id") or request_id)
@@ -1015,6 +878,7 @@ class YandexDeliveryProvider(DeliveryProvider):
                 "yandex_platform_destination": pick_point_id,
                 "yandex_delivery_window": window,
                 "status_time": latest_ts or state.get("timestamp_utc") or state.get("timestamp"),
+                "status_description": state.get("description"),
                 "pvz_name": pvz_name if "pvz_name" in locals() else None,
                 "pvz_address": pvz_address if "pvz_address" in locals() else None,
                 "pvz_phone": pvz_phone if "pvz_phone" in locals() else None,
