@@ -2899,6 +2899,14 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     )
         except Exception as e:
             lines.append(f"YM stocks unavailable: {e}")
+    if state.get("store_mon_tilda", True) and tilda_client.configured():
+        try:
+            tilda_products = await tilda_client.fetch_products()
+            lines.extend(tilda_site.format_stocks_block(tilda_products))
+        except TildaError as e:
+            logger.warning("Tilda stocks failed: %s", e)
+            lines.append("")
+            lines.append(f"🟣 Тильда недоступна: {e}")
     await update.message.reply_text("\n".join(lines), reply_markup=inline_main_kb())
 
 if __name__ == "__main__":

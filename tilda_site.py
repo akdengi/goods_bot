@@ -75,6 +75,18 @@ def format_products_block(products: Iterable[TildaProduct]) -> List[str]:
     return lines
 
 
+def format_stocks_block(products: Iterable[TildaProduct]) -> List[str]:
+    items = list(products)
+    if not items:
+        return []
+    lines = ["", f"{TILDA_EMOJI} {TILDA_TITLE} ({len(items)}):"]
+    for product in items:
+        sku = f" ({product.sku})" if product.sku else ""
+        stock = "—" if product.quantity is None else str(product.quantity)
+        lines.append(f"• {short(product.title, 60)}{sku}: Остаток {stock}")
+    return lines
+
+
 def format_prices_block(products: Iterable[TildaProduct]) -> List[str]:
     items = list(products)
     if not items:
