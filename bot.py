@@ -797,7 +797,7 @@ async def send_daily_report(application: Application) -> None:
 
     if state.get("store_mon_tilda", True) and tilda_client.configured():
         try:
-            tilda_recent = await tilda_client.fetch_orders(3)
+            tilda_recent = await tilda_client.fetch_orders(int(state.get("orders_days", 3) or 3))
             lines.extend(tilda_site.format_daily_block(tilda_recent, since_dt))
         except TildaError as e:
             logger.warning("Tilda daily report failed: %s", e)
@@ -1237,7 +1237,7 @@ async def check_tilda_alerts(application: Application) -> None:
     if not state.get("store_mon_tilda", True) or not tilda_client.configured():
         return
     try:
-        orders = await tilda_client.fetch_orders(15)
+        orders = await tilda_client.fetch_orders(int(state.get("orders_days", 3) or 3))
     except TildaError as e:
         logger.warning("Tilda alert check failed: %s", e)
         return
@@ -1413,7 +1413,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/remove &lt;product_id&gt; — удалить товар\n"
         "/setthreshold &lt;рубли&gt; — порог изменения цены\n"
         "/setstockthreshold &lt;шт&gt; — порог остатков\n"
-        "/setordersdays &lt;1-7&gt; — окно заказов в днях\n"
+        "/setordersdays &lt;1-30&gt; — окно заказов в днях\n"
         "/report — отправить ежедневный отчёт сейчас\n"
         "/status — статус\n"
         "/admins — список админов\n"
@@ -1811,7 +1811,6 @@ def settings_main_kb(state: Dict[str, Any]) -> InlineKeyboardMarkup:
     interval = int(state.get("check_interval", CHECK_INTERVAL_SEC)) // 60
     report = state.get("report_hour_local", 10)
     orders = state.get("orders_days", 3)
-    tilda_orders = state.get("tilda_orders_days", 15)
     stock = state.get("stock_threshold", STOCK_ALERT_THRESHOLD)
     warn = state.get("delivery_warn_hours", DELIVERY_STORAGE_WARN_HOURS)
     return InlineKeyboardMarkup(
@@ -1826,7 +1825,6 @@ def settings_main_kb(state: Dict[str, Any]) -> InlineKeyboardMarkup:
             [InlineKeyboardButton((("🟢 ⏸ Ozon мониторинг" if store_ozon_mon else "🔴 ▶️ Ozon мониторинг")), callback_data="storemonitor_ozon")],
             [InlineKeyboardButton((("🟢 ⏸ ЯМ мониторинг" if store_ym_mon else "🔴 ▶️ ЯМ мониторинг")), callback_data="storemonitor_ym")],
             [InlineKeyboardButton((("🟢 ⏸ Тильда мониторинг" if store_tilda_mon else "🔴 ▶️ Тильда мониторинг")), callback_data="storemonitor_tilda")],
-            [InlineKeyboardButton(f"🟣 Тильда: {tilda_orders} дн", callback_data="set_page:tilda")],
             [InlineKeyboardButton((("🟢 ⏸ Выключить мониторинг" if mon else "🔴 ▶️ Включить мониторинг")), callback_data="monitor_toggle")],
             [InlineKeyboardButton("🏠 Главное меню", callback_data="help_now")],
         ]
@@ -1844,7 +1842,7 @@ def settings_page_kb(page: str, state: Dict[str, Any]) -> InlineKeyboardMarkup:
         title, values = "Время ежедневного отчёта", [6, 7, 8, 9, 10, 11]
         cb, cur = "sethour", state.get("report_hour_local", 10)
     elif page == "orders":
-        title, values = "Окно заказов", [1, 2, 3, 5, 7]
+        title, values = "Окно заказов", [1, 2, 3, 5, 7, 15, 30]
         cb, cur = "setdays", state.get("orders_days", 3)
     elif page == "stock":
         title, values = "Порог остатков", [0, 1, 2, 3, 5]
@@ -1852,9 +1850,6 @@ def settings_page_kb(page: str, state: Dict[str, Any]) -> InlineKeyboardMarkup:
     elif page == "storage":
         title, values = "Предупреждать о сроке хранения", [6, 12, 24, 48, 72]
         cb, cur = "setwarn", state.get("delivery_warn_hours", DELIVERY_STORAGE_WARN_HOURS)
-    elif page == "tilda":
-        title, values = "Окно заказов Тильды", [15, 30]
-        cb, cur = "settilda", state.get("tilda_orders_days", 15)
     else:
         return settings_main_kb(state)
     rows = []
@@ -1882,7 +1877,6 @@ def settings_page_text(page: str, state: Dict[str, Any]) -> str:
     interval = int(state.get("check_interval", CHECK_INTERVAL_SEC)) // 60
     report = state.get("report_hour_local", 10)
     orders = state.get("orders_days", 3)
-    tilda_orders = state.get("tilda_orders_days", 15)
     stock = state.get("stock_threshold", STOCK_ALERT_THRESHOLD)
     warn = state.get("delivery_warn_hours", DELIVERY_STORAGE_WARN_HOURS)
     if page == "price":
@@ -1901,8 +1895,6 @@ def settings_page_text(page: str, state: Dict[str, Any]) -> str:
             "Бот пришлёт сообщение, когда посылка в ПВЗ и срок хранения подходит к концу. "
             "Выберите, за сколько часов предупреждать:"
         )
-    if page == "tilda":
-        return f"🟣 Окно заказов Тильды\nСейчас: {tilda_orders} дн\n\nВыберите значение:"
     return (
         "⚙️ Настройки\n"
         f"Мониторинг: {mon}\n"
@@ -1914,7 +1906,6 @@ def settings_page_text(page: str, state: Dict[str, Any]) -> str:
         f"Порог остатков: {stock} шт\n"
         f"Интервал проверки: {interval} мин\n"
         f"Окно заказов: {orders} дн\n"
-        f"Окно заказов Тильды: {tilda_orders} дн\n"
         f"Время отчёта: {report}:00 (серверное)\n"
         f"Предупреждение о хранении: за {warn} ч\n"
         f"Серверное время: {now} (Europe/Helsinki, UTC+2)\n"
@@ -2191,7 +2182,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             val = int(data.split(":", 1)[1])
         except (ValueError, IndexError):
             return
-        if not (1 <= val <= 7):
+        if not (1 <= val <= 30):
             return
         state["orders_days"] = val
         await storage.save(state)
@@ -2224,20 +2215,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         state["delivery_warn_hours"] = val
         await storage.save(state)
         await show_settings_page(query.message, "storage", edit=True)
-        return
-    if data.startswith("settilda:"):
-        state = await load_state()
-        if query.from_user.id not in state.get("admins", []):
-            return
-        try:
-            val = int(data.split(":", 1)[1])
-        except (ValueError, IndexError):
-            return
-        if val not in (15, 30):
-            return
-        state["tilda_orders_days"] = val
-        await storage.save(state)
-        await show_settings_page(query.message, "tilda", edit=True)
         return
     if data in ("sync_now", "sync"):
         msg = await query.message.reply_text("⏳ Синхронизирую…")
@@ -2472,7 +2449,7 @@ async def cmd_orders(update, context):
                 if created:
                     lines.append(f"  Создан: {fmt_date(created)}")
 
-    tilda_days = int(state.get("tilda_orders_days", 15) or 15)
+    tilda_days = int(state.get("orders_days", 3) or 3)
     if state.get("store_mon_tilda", True) and tilda_client.configured():
         try:
             tilda_orders = await tilda_client.fetch_orders(tilda_days)
@@ -2495,13 +2472,13 @@ async def cmd_tilda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _admin_guard(update):
         return
     state = await load_state()
-    days = int(state.get("tilda_orders_days", 15) or 15)
+    days = int(state.get("orders_days", 3) or 3)
     if context.args:
         try:
             value = int(context.args[0])
         except (ValueError, IndexError):
             value = days
-        if value in (15, 30):
+        if 1 <= value <= 90:
             days = value
     try:
         products = await tilda_client.fetch_products()
@@ -2516,27 +2493,19 @@ async def cmd_tilda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_tildaset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Совместимость: окно заказов Тильды теперь общее с Ozon/ЯМ (/setordersdays)."""
     if not await _admin_guard(update):
         return
     state = await load_state()
+    cur = state.get("orders_days", 3)
     if not context.args:
-        cur = state.get("tilda_orders_days", 15)
         await update.message.reply_text(
-            f"Окно заказов Тильды: {cur} дн.\nИспользование: /tildaset 30   (15 или 30)",
+            f"У Тильды теперь общее окно заказов: {cur} дн.\n"
+            "Изменить его можно в Настройках («Заказы: N дн») или командой /setordersdays N (1–30).",
             reply_markup=inline_main_kb(),
         )
         return
-    try:
-        days = int(context.args[0])
-    except (ValueError, IndexError):
-        await update.message.reply_text("Укажите 15 или 30, например /tildaset 30", reply_markup=inline_main_kb())
-        return
-    if days not in (15, 30):
-        await update.message.reply_text("Допустимые значения: 15 или 30 дней.", reply_markup=inline_main_kb())
-        return
-    state["tilda_orders_days"] = days
-    await storage.save(state)
-    await update.message.reply_text(f"✅ Окно заказов Тильды: {days} дн.", reply_markup=inline_main_kb())
+    await cmd_setordersdays(update, context)
 
 
 async def cmd_setinterval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2702,7 +2671,7 @@ async def cmd_setordersdays(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not context.args:
         await update.message.reply_text(
             f"Текущее окно заказов: {state.get('orders_days', 3)} дн.\n"
-            "Использование: /setordersdays 3 (от 1 до 7)",
+            "Использование: /setordersdays 3 (от 1 до 30)",
             reply_markup=inline_main_kb(),
         )
         return
@@ -2711,8 +2680,8 @@ async def cmd_setordersdays(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except (ValueError, IndexError):
         await update.message.reply_text("Укажите число дней, например /setordersdays 3")
         return
-    if not (1 <= days <= 7):
-        await update.message.reply_text("Окно заказов может быть от 1 до 7 дней.")
+    if not (1 <= days <= 30):
+        await update.message.reply_text("Окно заказов может быть от 1 до 30 дней.")
         return
     state["orders_days"] = days
     await storage.save(state)
