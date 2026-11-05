@@ -549,6 +549,13 @@ class CdekDeliveryProvider(DeliveryProvider):
             extra={"im_number": number, "storage_estimated": bool(pickup_ready_at and not delivered)},
         )
 
+    @staticmethod
+    def _is_deleted(code: str, status: str) -> bool:
+        """Удалённые заказы СДЭК: v1.5 отдаёт «Удален», v2 — REMOVED/DELETED."""
+        code_upper = (code or "").strip().upper()
+        status_lower = (status or "").strip().lower()
+        return code_upper in ("REMOVED", "DELETED") or "удал" in status_lower
+
     async def fetch(self, since: datetime, to: datetime, limit: int = 200) -> List[Shipment]:
         if not self.configured():
             raise ShippingError("СДЭК не настроен: заполните CDEK_ACCOUNT и CDEK_SECURE_PASSWORD")
@@ -576,7 +583,8 @@ class CdekDeliveryProvider(DeliveryProvider):
                     )
             return self._build_from_xml(order_el)
 
-        return list(await asyncio.gather(*(build(el) for el in orders)))
+        shipments = list(await asyncio.gather(*(build(el) for el in orders)))
+        return [s for s in shipments if not self._is_deleted(s.status_code, s.status)]
 
 
 # ---------------------------------------------------------------------------

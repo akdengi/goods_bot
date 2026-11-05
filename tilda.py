@@ -364,6 +364,9 @@ class TildaClient:
                         continue
                     seen.add(key)
                     fresh += 1
+                    if order.is_cancelled:
+                        # Отменённые заказы сайта в отчётах не показываем.
+                        continue
                     if order.created is None or order.created >= since:
                         orders.append(order)
                 if fresh == 0 or len(items) < PAGE_SIZE:
