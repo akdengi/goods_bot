@@ -2835,6 +2835,10 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await check_delivery_alerts(context.application)
     except Exception as e:
         logger.warning("Delivery check failed: %s", e)
+    try:
+        await check_tilda_alerts(context.application)
+    except Exception as e:
+        logger.warning("Tilda check failed: %s", e)
     await update.message.reply_text("✅ Проверка завершена. Уведомления отправлены при изменениях.", reply_markup=inline_main_kb())
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
