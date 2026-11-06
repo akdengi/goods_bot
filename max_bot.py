@@ -234,7 +234,7 @@ class MaxMessage:
         mid = None
         if isinstance(msg, dict):
             mid = ((msg.get("body") or {}).get("mid")) or None
-        return MaxMessage(self._client, self.chat.id, mid, self._fmt(parse_mode))
+        return MaxMessage(self._client, self.chat.id, mid, _fmt(parse_mode))
 
     async def edit_text(self, text: str, reply_markup: Any = None, parse_mode: Any = None, **_: Any) -> None:
         if not self._mid:
