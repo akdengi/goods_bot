@@ -1,6 +1,6 @@
 # Market Goods Bot
 
-Бот для продавца маркетплейсов: Ozon, Яндекс Маркет, сайт на Тильде, а также доставок через Ozon, СДЭК и Яндекс Доставку.
+Бот для продавца маркетплейсов: Ozon, Яндекс Маркет, сайт на Тильде, а также доставок через Ozon, СДЭК и Яндекс Доставку. Работает в двух мессенджерах: **Telegram** и **MAX** — общий код мониторинга, разные транспортные модули (`bot.py` для Telegram, `max_bot.py` для MAX).
 
 Бот отслеживает цены, остатки FBO/FBS, возвраты, отзывы, заказы, товары и заказы сайта, доставки, показывает отчёты отдельно для источников и отправляет уведомления при важных изменениях.
 
@@ -17,11 +17,23 @@
 - Ежедневный отчёт.
 - Настройки через inline-кнопки.
 
+## Telegram и MAX
+
+| | Telegram (`bot.py`) | MAX (`max_bot.py`) |
+|---|---|---|
+| Транспорт | long polling (python-telegram-bot) | long polling `GET /updates` (MAX Bot API, `platform-api2.max.ru`) |
+| Токен | `TELEGRAM_BOT_TOKEN` | `MAX_BOT_TOKEN` (из business.max.ru) |
+| Доступ | первый `/start` становится владельцем (`ADMIN_CHAT_ID` — заранее) | приватно: «Поделиться контактом», номер в `MAX_ADMIN_PHONES` (запасной вход — `MAX_ADMIN_USER_IDS`) |
+| Состояние | `DATA_DIR` (по умолчанию `data`) | `MAX_DATA_DIR` (по умолчанию `data_max`) |
+| Сервис (пример) | `ozon_goods_bot.service` | `max_goods_bot.service` |
+
+Оба бота могут работать параллельно на одном сервере: бизнес-логика, клиенты API и отчёты общие, а состояния разделены. Команды и inline-меню одинаковы в обоих мессенджерах.
+
 ## Требования
 
 - Python 3.11+
 - Ozon Seller API credentials
-- Telegram bot token
+- Telegram bot token и/или MAX bot token
 - опционально: токены Яндекс Доставки, СДЭК, Яндекс Маркета, MCP-токен Тильды
 
 ## Установка
@@ -45,33 +57,39 @@ python bot.py
 
 ## Развёртывание на сервере (Linux)
 
-Рабочая копия: `/root/ozon_goods_bot`, сервис systemd `ozon_goods_bot.service`.
+Рабочая копия: `/root/ozon_goods_bot`. Сервисы systemd: `ozon_goods_bot.service` (Telegram), `max_goods_bot.service` (MAX).
 
 1. Обновите файлы в `/root/ozon_goods_bot`. Файл `.env` не перезаписывается деплоем.
 2. Проверьте синтаксис:
 
 ```bash
-python3 -m py_compile bot.py tilda.py tilda_site.py shipping.py
+python3 -m py_compile bot.py max_bot.py tilda.py tilda_site.py shipping.py
 ```
 
-3. Перезапустите сервис и проверьте статус:
+3. Перезапустите нужные сервисы и проверьте статус:
 
 ```bash
-systemctl restart ozon_goods_bot.service
-systemctl is-active ozon_goods_bot.service
+systemctl restart ozon_goods_bot.service   # Telegram
+systemctl restart max_goods_bot.service    # MAX
+systemctl is-active ozon_goods_bot.service max_goods_bot.service
 ```
 
 4. Логи:
 
 ```bash
 journalctl -u ozon_goods_bot.service -n 50 --no-pager
+journalctl -u max_goods_bot.service -n 50 --no-pager
 ```
 
-Секреты хранятся только в `/root/ozon_goods_bot/.env` (права `600`). После изменения `.env` перезапустите сервис.
+Секреты хранятся только в `/root/ozon_goods_bot/.env` (права `600`). После изменения `.env` перезапустите сервисы.
 
 ## Основные переменные `.env`
 
 - `TELEGRAM_BOT_TOKEN`
+- `MAX_BOT_TOKEN` — токен бота MAX (business.max.ru → Чат-боты → Настройки)
+- `MAX_ADMIN_PHONES` — номера владельца через запятую (вход в MAX по «Поделиться контактом»)
+- `MAX_ADMIN_USER_IDS` — запасной вход в MAX по user_id (можно оставить пустым)
+- `MAX_DATA_DIR` — каталог состояния MAX-бота (по умолчанию `data_max`)
 - `OZON_CLIENT_ID`
 - `OZON_API_KEY`
 - `YANDEX_MARKET_API_KEY`
@@ -85,16 +103,18 @@ journalctl -u ozon_goods_bot.service -n 50 --no-pager
 
 ## Команды
 
-- `/start` — регистрация владельца (первый запуск)
+Одинаковые в Telegram и MAX:
+
+- `/start` — регистрация владельца (в MAX — подтверждение по контакту)
 - `/help`
-- `/sync` — забрать товары из Ozon и обновить цены/остатки
-- `/check` — проверить цены, остатки и возвраты сейчас
+- `/sync` — забрать товары из Ozon и обновить цены/остатки (в отчёте также Тильда и Яндекс Маркет)
+- `/check` — проверить цены, остатки, возвраты, доставки и Тильду сейчас
 - `/list [N]`, `/stock [N]`, `/returns [N]`
 - `/prices`, `/index`, `/orders`
 - `/deliveries` — отчёты по доставкам (Ozon, Яндекс Доставка, СДЭК, Яндекс Маркет)
 - `/reviews`, `/returnstats`, `/ym`
-- `/tilda [15|30]` — товары в продаже и заказы сайта Тильды
-- `/tildaset 15|30` — окно заказов сайта (также меняется в `/settings`)
+- `/tilda [N]` — товары в продаже и заказы сайта Тильды
+- `/settings` — все настройки (окно заказов 1–30 дн общее для Ozon/ЯМ/Тильды)
 
 ## Безопасность
 

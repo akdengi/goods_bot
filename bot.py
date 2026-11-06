@@ -1524,6 +1524,15 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await send_to_admins(context.application, f"YM sync failed: {e}")
             ym_offer_count = 0
 
+    tilda_count = 0
+    if state.get("store_mon_tilda", True) and tilda_client.configured():
+        try:
+            tilda_products = await tilda_client.fetch_products()
+            tilda_count = len(tilda_products)
+        except TildaError as e:
+            logger.warning("Tilda sync failed: %s", e)
+            tilda_count = -1  # пометка «недоступна»
+
     ref_ids = {r["product_id"] for r in refs}
     removed = [pid for pid in list(tracked.keys()) if int(pid) not in ref_ids]
     for pid in removed:
@@ -1549,7 +1558,12 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Цен получено: {len(price_map)}\n"
         f"Остатков получено: {len(stock_map)}\n"
         f"Возвратов просмотрено: {len(returns_list)}\n"
-        + (f"Офферов Яндекс Маркет: {ym_offer_count}" if ym_offer_count else ""),
+        + (f"Офферов Яндекс Маркет: {ym_offer_count}\n" if ym_offer_count else "")
+        + (
+            (f"Товаров Тильда: {tilda_count}" if tilda_count >= 0 else "🟣 Тильда недоступна")
+            if state.get("store_mon_tilda", True) and tilda_client.configured()
+            else ""
+        ),
         reply_markup=inline_main_kb(),
     )
     await update.message.reply_text("Главное меню:", reply_markup=inline_main_kb())
