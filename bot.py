@@ -176,11 +176,11 @@ async def load_state() -> Dict[str, Any]:
 def is_admin(chat_id: int, state: Dict[str, Any]) -> bool:
     return chat_id in (state.get("admins") or [])
 
-async def send_to_admins(context_or_app, text: str) -> None:
+async def send_to_admins(context_or_app, text: str, reply_markup: Any = None) -> None:
     state = await load_state()
     for cid in state.get("admins") or []:
         try:
-            kb = inline_main_kb()
+            kb = reply_markup if reply_markup is not None else inline_main_kb()
             if hasattr(context_or_app, "bot"):
                 await context_or_app.bot.send_message(chat_id=cid, text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
             else:
@@ -1270,6 +1270,182 @@ async def check_tilda_alerts(application: Application) -> None:
         await send_to_admins(application, tilda_site.format_new_paid_alert(order))
 
 
+# ---------------------------------------------------------------------------
+# Тильда × СДЭК/Яндекс Доставка: авто-статусы по подтверждению владельца
+# ---------------------------------------------------------------------------
+
+TILDA_STATUS_PICKUP = 1001      # «Ожидает в ПВЗ/на Почте/у Курьера»
+TILDA_STATUS_DONE = 3           # «Завершён» (системный)
+
+PICKUP_TEXT_CDEK = "Заказ ждет вас в ПВЗ СДЭК. Срок хранения - 7 дней. Трек-номер {track}"
+PICKUP_TEXT_YANDEX = (
+    "Заказ ждет вас в ПВЗ Яндекс Маркета. Срок хранения 7 дней. "
+    "Если вы не видите отображение вашего заказа в приложении Яндекс Go, "
+    "возможно вы задали неверный номер сотового при оформлении. "
+    "Напишите нам и мы поправим это, связавшись с техподдержкой."
+)
+DONE_COURSES_TEXT = "Курс уже доступен в вашем личном кабинете на сайте https://simplrobot.ru"
+
+# Коды статусов «посылка в ПВЗ/на складе»
+CDEK_PICKUP_CODES = {"ACCEPTED_AT_PICK_UP_POINT", "READY_AT_PICKUP_POINT"}
+YANDEX_PICKUP_CODES = {"DELIVERY_ARRIVED_PICKUP_POINT", "PICKUP"}
+
+
+def _order_action_kb(order_number: str, action: str, with_courses: bool = False) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Да", callback_data=f"taction:yes:{action}:{order_number}:{int(with_courses)}"),
+                InlineKeyboardButton("❌ Нет", callback_data=f"taction:no:{action}:{order_number}:{int(with_courses)}"),
+            ],
+            [InlineKeyboardButton("🏠 Меню", callback_data="help_now")],
+        ]
+    )
+
+
+async def check_tilda_shipping_sync(application: Application) -> None:
+    """Сопоставляет заказы Тильды с доставками СДЭК/Яндекс и предлагает смену статусов.
+
+    Ничего не меняет сам: публикует в чат кнопки «Да/Нет», выполняет действие
+    только после подтверждения владельцем (см. callback_handler, префикс taction:).
+    """
+    state = await load_state()
+    if not state.get("store_mon_tilda", True) or not tilda_client.configured():
+        return
+    pending = state.setdefault("tilda_shipping_pending", {})
+    offers = state.setdefault("tilda_shipping_offered", {})
+    now = datetime.now(timezone.utc)
+    changed = False
+
+    # Очистка старых записей (30 дней)
+    cutoff = (now - timedelta(days=30)).isoformat()
+    for book in (pending, offers):
+        for key in list(book.keys()):
+            if str((book[key] or {}).get("ts") or "") < cutoff:
+                del book[key]
+                changed = True
+
+    days = int(state.get("orders_days", 3) or 3)
+    orders = await tilda_client.fetch_orders(max(days, 30))
+    active = [
+        o for o in orders
+        if o.status_id not in ("", "3", "4") and not o.is_cancelled
+    ]
+    if not active:
+        if changed:
+            await storage.save(state)
+        return
+
+    # Доставки за 30 дней
+    deliveries = await shipping.fetch_all(now - timedelta(days=30), now, limit=200)
+    by_cdek_im: Dict[str, Any] = {}
+    by_yandex_id: Dict[str, Any] = {}
+    for s in deliveries:
+        if s.provider == "cdek":
+            im = str((s.extra or {}).get("im_number") or "")
+            if im:
+                by_cdek_im[im] = s
+        elif s.provider == "yandex":
+            by_yandex_id[str(s.shipment_id)] = s
+
+    for order in active:
+        num = order.number
+        if not num or num in pending or num in offers:
+            continue
+        shipment = by_cdek_im.get(num) or by_yandex_id.get(num)
+        if shipment is None:
+            continue
+        code = str(shipment.status_code or "").upper()
+        is_pickup = code in CDEK_PICKUP_CODES or code in YANDEX_PICKUP_CODES
+        is_delivered = bool(shipment.is_delivered)
+        if not is_pickup and not is_delivered:
+            continue
+
+        if is_pickup:
+            if shipment.provider == "cdek":
+                track = shipment.shipment_id or str((shipment.extra or {}).get("im_number") or "") or order.tracking_number
+                text = PICKUP_TEXT_CDEK.format(track=track)
+                carrier = "СДЭК"
+            else:
+                text = PICKUP_TEXT_YANDEX
+                carrier = "Яндекс"
+            lines = [
+                "📦 Заказ Тильды пришёл в ПВЗ",
+                f"№ {num} — {order.customer}, {order.city}",
+                f"Служба: {carrier}, статус «{shipment.status}»",
+                "",
+                "Сменить статус на «Ожидает в ПВЗ/на Почте/у Курьера» и отправить письмо покупателю?",
+                f"Текст письма: «{text}»",
+            ]
+            pending[num] = {"ts": now_iso(), "action": "pickup", "text": text, "carrier": carrier}
+        else:
+            lines = [
+                "📬 Заказ Тильды доставлен",
+                f"№ {num} — {order.customer}, {order.city}",
+                f"Служба: {'СДЭК' if shipment.provider == 'cdek' else 'Яндекс'}, статус «{shipment.status}»",
+                "",
+                "Сменить статус на «Завершён»? Отправить информацию о курсах письмом?",
+                f"Текст: «{DONE_COURSES_TEXT}»",
+            ]
+            pending[num] = {"ts": now_iso(), "action": "done", "text": DONE_COURSES_TEXT, "carrier": "СДЭК" if shipment.provider == "cdek" else "Яндекс"}
+        offers[num] = {"ts": now_iso()}
+        changed = True
+        await send_to_admins(application, "\n".join(lines), reply_markup=_order_action_kb(num, pending[num]["action"]))
+        logger.info("Tilda shipping offer: %s %s (%s)", num, pending[num]["action"], pending[num]["carrier"])
+
+    if changed:
+        await storage.save(state)
+
+
+async def apply_tilda_action(application: Application, order_number: str, action: str, with_courses: bool) -> str:
+    """Выполняет подтверждённое действие: смена статуса и/или письма-комментария."""
+    state = await load_state()
+    pending = state.get("tilda_shipping_pending") or {}
+    meta = pending.get(order_number) or {}
+    results = []
+    try:
+        if action == "pickup":
+            try:
+                await tilda_client.set_order_status(order_number, TILDA_STATUS_PICKUP)
+                results.append("статус → «Ожидает в ПВЗ/на Почте/у Курьера»")
+            except TildaError as e:
+                if "same_status" in str(e):
+                    results.append("статус уже «Ожидает в ПВЗ/на Почте/у Курьера»")
+                else:
+                    raise
+            text = meta.get("text")
+            if not text:
+                # Меты нет (например, предложение удалено): восстанавливаем текст по службе.
+                detail = await tilda_client.fetch_order_detail(order_number)
+                carrier = "cdek" if (detail and detail.delivery and "СДЭК" in detail.delivery) else "yandex"
+                if carrier == "cdek":
+                    track = (detail.tracking_number if detail else "") or order_number
+                    text = PICKUP_TEXT_CDEK.format(track=track)
+                else:
+                    text = PICKUP_TEXT_YANDEX
+            await tilda_client.set_public_comment(order_number, text)
+            results.append("письмо отправлено")
+        else:  # done
+            try:
+                await tilda_client.set_order_status(order_number, TILDA_STATUS_DONE)
+                results.append("статус → «Завершён»")
+            except TildaError as e:
+                if "same_status" in str(e):
+                    results.append("статус уже «Завершён»")
+                else:
+                    raise
+            if with_courses:
+                await tilda_client.set_public_comment(order_number, DONE_COURSES_TEXT)
+                results.append("письмо о курсах отправлено")
+    except TildaError as e:
+        logger.warning("Tilda action failed: %s", e)
+        return f"❌ Ошибка Тильды: {e}"
+    finally:
+        pending.pop(order_number, None)
+        await storage.save(state)
+    return "✅ Заказ № " + order_number + ": " + ", ".join(results)
+
+
 async def periodic_loop(application: Application) -> None:
     await asyncio.sleep(10)
     while True:
@@ -1296,6 +1472,12 @@ async def periodic_loop(application: Application) -> None:
                 raise
             except Exception as e:
                 logger.exception("Periodic Tilda alerts failed: %s", e)
+            try:
+                await check_tilda_shipping_sync(application)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.exception("Periodic Tilda shipping sync failed: %s", e)
             try:
                 st = await load_state()
                 now_local = datetime.now()
@@ -1344,6 +1526,10 @@ async def startup_check(application: Application) -> None:
             await check_tilda_alerts(application)
         except Exception as e:
             logger.warning("Startup Tilda check failed: %s", e)
+        try:
+            await check_tilda_shipping_sync(application)
+        except Exception as e:
+            logger.warning("Startup Tilda shipping sync failed: %s", e)
 
 
 async def post_shutdown(application: Application) -> None:
@@ -2255,6 +2441,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if data == "help_now":
         await show_main_menu(query.message, edit=True)
         return
+    if data.startswith("taction:"):
+        parts = data.split(":")
+        if len(parts) < 5:
+            return
+        answer, action, order_number, with_courses = parts[1], parts[2], parts[3], parts[4] == "1"
+        state = await load_state()
+        if query.from_user.id not in state.get("admins", []):
+            await query.answer("Доступ запрещён")
+            return
+        if answer == "no":
+            pending = state.get("tilda_shipping_pending") or {}
+            pending.pop(order_number, None)
+            await storage.save(state)
+            await query.answer("Отменено")
+            await _show_inline_message(query.message, f"👌 Заказ № {order_number}: действие отменено.", inline_main_kb(), edit=True)
+            return
+        await query.answer("Выполняю…")
+        result = await apply_tilda_action(context.application, order_number, action, with_courses)
+        await _show_inline_message(query.message, result, inline_main_kb(), edit=True)
+        return
     if data == "settings":
         await show_settings_page(query.message, "main", edit=True)
         return
@@ -2853,6 +3059,10 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await check_tilda_alerts(context.application)
     except Exception as e:
         logger.warning("Tilda check failed: %s", e)
+    try:
+        await check_tilda_shipping_sync(context.application)
+    except Exception as e:
+        logger.warning("Tilda shipping sync failed: %s", e)
     await update.message.reply_text("✅ Проверка завершена. Уведомления отправлены при изменениях.", reply_markup=inline_main_kb())
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

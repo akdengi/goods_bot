@@ -1,8 +1,8 @@
 """Клиент Tilda Store через MCP.
 
-Мост намеренно тонкий и только на чтение. Бот не умеет менять статусы заказов:
-снаружи вызываются только ``store_get_products_list``, ``store_get_orders_list``
-и ``store_get_orders_statuses``.
+Чтение: товары, заказы, статусы. Запись (только по явному подтверждению
+владельца в чате): смена статуса заказа и публичный комментарий, который
+Тильда отправляет покупателю письмом при изменении.
 
 Запрос идёт напрямую по HTTP (Streamable MCP), без дочернего процесса, чтобы на
 сервере не плодить лишние ``python`` и не зависеть от прав доступа к файлам.
@@ -107,6 +107,11 @@ class TildaOrder:
     delivery: str
     items: List[str] = field(default_factory=list)
     quantity: int = 0
+    email: str = ""
+    status_id: str = ""
+    tracking_type: str = ""
+    tracking_number: str = ""
+    public_comment: str = ""
 
     @property
     def is_cancelled(self) -> bool:
@@ -279,6 +284,54 @@ class TildaClient:
 
         return await self._with_client(handler)
 
+    # ---------- запись (только по подтверждению владельца) ----------
+
+    async def fetch_order_detail(self, order_number: str) -> Optional[TildaOrder]:
+        """Полные данные одного заказа (public_comment, tracking — есть только здесь)."""
+        async def handler(client: httpx.AsyncClient) -> Optional[TildaOrder]:
+            titles = await self.fetch_status_titles(client)
+            data = await self._call(
+                client,
+                "store_get_orders",
+                {"projectid": self.project_id, "formsref": int(order_number)},
+            )
+            item = data.get("order") if isinstance(data, dict) and isinstance(data.get("order"), dict) else data
+            if not isinstance(item, dict) or not item:
+                return None
+            return self._order_from_raw(item, titles)
+
+        return await self._with_client(handler)
+
+    async def set_order_status(self, order_number: str, status_id: int) -> None:
+        """Меняет статус заказа (например, 1001 «Ожидает в ПВЗ», 3 «Завершён»)."""
+        async def handler(client: httpx.AsyncClient) -> None:
+            await self._call(
+                client,
+                "store_set_orders_status",
+                {
+                    "projectid": self.project_id,
+                    "formsref": int(order_number),
+                    "orderstatusid": int(status_id),
+                },
+            )
+
+        await self._with_client(handler)
+
+    async def set_public_comment(self, order_number: str, text: str) -> None:
+        """Обновляет публичный комментарий заказа (отправляется покупателю письмом)."""
+        async def handler(client: httpx.AsyncClient) -> None:
+            await self._call(
+                client,
+                "store_save_orders_field",
+                {
+                    "projectid": self.project_id,
+                    "formsref": int(order_number),
+                    "public_comment": text,
+                },
+            )
+
+        await self._with_client(handler)
+
     async def fetch_status_titles(self, client: Optional[httpx.AsyncClient] = None) -> Dict[str, str]:
         if self._status_cache:
             return dict(self._status_cache)
@@ -336,6 +389,11 @@ class TildaClient:
             delivery=_text(shipping.get("name")) or _text(shipping.get("pickup-name")),
             items=items,
             quantity=quantity,
+            email=_text(item.get("email")),
+            status_id=status_id,
+            tracking_type=_text((item.get("tracking") or {}).get("type")) if isinstance(item.get("tracking"), dict) else "",
+            tracking_number=_text((item.get("tracking") or {}).get("number")) if isinstance(item.get("tracking"), dict) else "",
+            public_comment=_text(item.get("public_comment")),
         )
 
     async def fetch_orders(self, days: int = 15) -> List[TildaOrder]:
