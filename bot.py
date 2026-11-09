@@ -1286,6 +1286,13 @@ PICKUP_TEXT_YANDEX = (
 )
 DONE_COURSES_TEXT = "Курс уже доступен в вашем личном кабинете на сайте https://simplrobot.ru"
 
+STORAGE_EXPIRING_TEXT = (
+    "У вас истекает срок хранения заказа в ПВЗ. Просьба срочно забрать его, "
+    "иначе он уедет к нам назад и мы вынуждены будем попросить вас повторно "
+    "оплатить доставку или мы автоматически вернем вам средства, но за вычетом "
+    "затрат на пересылку."
+)
+
 # Коды статусов «посылка в ПВЗ/на складе»
 CDEK_PICKUP_CODES = {"ACCEPTED_AT_PICK_UP_POINT", "READY_AT_PICKUP_POINT"}
 YANDEX_PICKUP_CODES = {"DELIVERY_ARRIVED_PICKUP_POINT", "PICKUP"}
@@ -1358,10 +1365,17 @@ async def check_tilda_shipping_sync(application: Application) -> None:
         code = str(shipment.status_code or "").upper()
         is_pickup = code in CDEK_PICKUP_CODES or code in YANDEX_PICKUP_CODES
         is_delivered = bool(shipment.is_delivered)
-        if not is_pickup and not is_delivered:
+        exp_dt = parse_dt(shipment.storage_expires_at)
+        warn_hours = int(state.get("delivery_warn_hours", DELIVERY_STORAGE_WARN_HOURS) or DELIVERY_STORAGE_WARN_HOURS)
+        expiring_soon = (
+            exp_dt is not None
+            and not is_delivered
+            and exp_dt <= now + timedelta(hours=warn_hours)
+        )
+        if not is_pickup and not is_delivered and not expiring_soon:
             continue
 
-        if is_pickup:
+        if is_pickup and not expiring_soon:
             if shipment.provider == "cdek":
                 track = shipment.shipment_id or str((shipment.extra or {}).get("im_number") or "") or order.tracking_number
                 text = PICKUP_TEXT_CDEK.format(track=track)
@@ -1378,7 +1392,32 @@ async def check_tilda_shipping_sync(application: Application) -> None:
                 f"Текст письма: «{text}»",
             ]
             pending[num] = {"ts": now_iso(), "action": "pickup", "text": text, "carrier": carrier}
-        else:
+            offers[num] = {"ts": now_iso()}
+            changed = True
+            await send_to_admins(application, "\n".join(lines), reply_markup=_order_action_kb(num, "pickup"))
+            logger.info("Tilda shipping offer: %s pickup (%s)", num, carrier)
+            continue
+
+        # Срок хранения истекает (заказ уже должен быть в статусе «Ожидает в ПВЗ»)
+        if exp_dt and not is_delivered:
+            carrier = "СДЭК" if shipment.provider == "cdek" else "Яндекс"
+            hours_left = max(0, int((exp_dt - now).total_seconds() // 3600))
+            lines = [
+                "⏰ Истекает срок хранения заказа Тильды в ПВЗ",
+                f"№ {num} — {order.customer}, {order.city}",
+                f"Служба: {carrier}, хранение до {fmt_date(shipment.storage_expires_at)} (осталось ~{hours_left} ч)",
+                "",
+                "Отправить покупателю письмо о срочном получении?",
+                f"Текст письма: «{STORAGE_EXPIRING_TEXT}»",
+            ]
+            pending[num] = {"ts": now_iso(), "action": "expiring", "text": STORAGE_EXPIRING_TEXT, "carrier": carrier}
+            offers[num] = {"ts": now_iso()}
+            changed = True
+            await send_to_admins(application, "\n".join(lines), reply_markup=_order_action_kb(num, "expiring"))
+            logger.info("Tilda shipping offer: %s expiring (%s)", num, carrier)
+            continue
+
+        if is_delivered:
             lines = [
                 "📬 Заказ Тильды доставлен",
                 f"№ {num} — {order.customer}, {order.city}",
@@ -1388,10 +1427,10 @@ async def check_tilda_shipping_sync(application: Application) -> None:
                 f"Текст: «{DONE_COURSES_TEXT}»",
             ]
             pending[num] = {"ts": now_iso(), "action": "done", "text": DONE_COURSES_TEXT, "carrier": "СДЭК" if shipment.provider == "cdek" else "Яндекс"}
-        offers[num] = {"ts": now_iso()}
-        changed = True
-        await send_to_admins(application, "\n".join(lines), reply_markup=_order_action_kb(num, pending[num]["action"]))
-        logger.info("Tilda shipping offer: %s %s (%s)", num, pending[num]["action"], pending[num]["carrier"])
+            offers[num] = {"ts": now_iso()}
+            changed = True
+            await send_to_admins(application, "\n".join(lines), reply_markup=_order_action_kb(num, "done"))
+            logger.info("Tilda shipping offer: %s done (%s)", num, pending[num]["carrier"])
 
     if changed:
         await storage.save(state)
@@ -1425,6 +1464,10 @@ async def apply_tilda_action(application: Application, order_number: str, action
                     text = PICKUP_TEXT_YANDEX
             await tilda_client.set_public_comment(order_number, text)
             results.append("письмо отправлено")
+        elif action == "expiring":
+            text = meta.get("text") or STORAGE_EXPIRING_TEXT
+            await tilda_client.set_public_comment(order_number, text)
+            results.append("письмо о сроке хранения отправлено")
         else:  # done
             try:
                 await tilda_client.set_order_status(order_number, TILDA_STATUS_DONE)
