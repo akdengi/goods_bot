@@ -1293,6 +1293,13 @@ STORAGE_EXPIRING_TEXT = (
     "затрат на пересылку."
 )
 
+NEW_ORDER_TEXT = (
+    "Ваш заказ принят в обработку. Мы соберем его, бережно упакуем и отправим вам "
+    "в ближайшее время. Следите за статусом вашего заказа в Личном Кабинете."
+)
+
+TILDA_STATUS_PROCESSING = 1500  # «В обработке»
+
 # Коды статусов «посылка в ПВЗ/на складе»
 CDEK_PICKUP_CODES = {"ACCEPTED_AT_PICK_UP_POINT", "READY_AT_PICKUP_POINT"}
 YANDEX_PICKUP_CODES = {"DELIVERY_ARRIVED_PICKUP_POINT", "PICKUP"}
@@ -1359,6 +1366,24 @@ async def check_tilda_shipping_sync(application: Application) -> None:
         num = order.number
         if not num or num in pending or num in offers:
             continue
+
+        # Новый заказ (статус «Новый»): предложить «В обработке» + письмо.
+        if order.status_id == "2":
+            lines = [
+                "🆕 Новый заказ Тильды",
+                f"№ {num} — {order.customer}, {order.city}, {tilda_site.money(order.amount)} {tilda_site.currency_sign(order.currency)}",
+                ", ".join(order.items[:2])[:80],
+                "",
+                "Сменить статус на «В обработке» и отправить письмо покупателю?",
+                f"Текст письма: «{NEW_ORDER_TEXT}»",
+            ]
+            pending[num] = {"ts": now_iso(), "action": "new_order", "text": NEW_ORDER_TEXT, "carrier": ""}
+            offers[num] = {"ts": now_iso()}
+            changed = True
+            await send_to_admins(application, "\n".join(lines), reply_markup=_order_action_kb(num, "new_order"))
+            logger.info("Tilda shipping offer: %s new_order", num)
+            continue
+
         shipment = by_cdek_im.get(num) or by_yandex_id.get(num)
         if shipment is None:
             continue
@@ -1468,6 +1493,18 @@ async def apply_tilda_action(application: Application, order_number: str, action
             text = meta.get("text") or STORAGE_EXPIRING_TEXT
             await tilda_client.set_public_comment(order_number, text)
             results.append("письмо о сроке хранения отправлено")
+        elif action == "new_order":
+            try:
+                await tilda_client.set_order_status(order_number, TILDA_STATUS_PROCESSING)
+                results.append("статус → «В обработке»")
+            except TildaError as e:
+                if "same_status" in str(e):
+                    results.append("статус уже «В обработке»")
+                else:
+                    raise
+            text = meta.get("text") or NEW_ORDER_TEXT
+            await tilda_client.set_public_comment(order_number, text)
+            results.append("письмо отправлено")
         else:  # done
             try:
                 await tilda_client.set_order_status(order_number, TILDA_STATUS_DONE)
