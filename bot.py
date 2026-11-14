@@ -1300,6 +1300,26 @@ NEW_ORDER_TEXT = (
 
 TILDA_STATUS_PROCESSING = 1500  # «В обработке»
 
+# Редактируемые шаблоны писем (переопределения хранятся в state["tilda_texts"])
+TILDA_TEXT_DEFAULTS = {
+    "new_order": NEW_ORDER_TEXT,
+    "pickup_cdek": PICKUP_TEXT_CDEK,
+    "pickup_yandex": PICKUP_TEXT_YANDEX,
+    "expiring": STORAGE_EXPIRING_TEXT,
+    "done": DONE_COURSES_TEXT,
+}
+TILDA_TEXT_TITLES = {
+    "new_order": "Новый заказ",
+    "pickup_cdek": "Пришёл в ПВЗ (СДЭК)",
+    "pickup_yandex": "Пришёл в ПВЗ (Яндекс)",
+    "expiring": "Истекает срок хранения",
+    "done": "Доставлен (курсы)",
+}
+
+
+def get_tilda_text(state: Dict[str, Any], key: str) -> str:
+    return (state.get("tilda_texts") or {}).get(key) or TILDA_TEXT_DEFAULTS.get(key, "")
+
 # Коды статусов «посылка в ПВЗ/на складе»
 CDEK_PICKUP_CODES = {"ACCEPTED_AT_PICK_UP_POINT", "READY_AT_PICKUP_POINT"}
 YANDEX_PICKUP_CODES = {"DELIVERY_ARRIVED_PICKUP_POINT", "PICKUP"}
@@ -1312,6 +1332,7 @@ def _order_action_kb(order_number: str, action: str, with_courses: bool = False)
                 InlineKeyboardButton("✅ Да", callback_data=f"taction:yes:{action}:{order_number}:{int(with_courses)}"),
                 InlineKeyboardButton("❌ Нет", callback_data=f"taction:no:{action}:{order_number}:{int(with_courses)}"),
             ],
+            [InlineKeyboardButton("✏️ Свой текст", callback_data=f"taction:edit:{action}:{order_number}:{int(with_courses)}")],
             [InlineKeyboardButton("🏠 Меню", callback_data="help_now")],
         ]
     )
@@ -1371,15 +1392,16 @@ async def check_tilda_shipping_sync(application: Application) -> None:
 
         # Новый заказ (статус «Новый»): предложить «В обработке» + письмо.
         if order.status_id == "2" and "new_order" not in offered_actions and pending_meta.get("action") != "new_order":
+            new_text = get_tilda_text(state, "new_order")
             lines = [
                 "🆕 Новый заказ Тильды",
                 f"№ {num} — {order.customer}, {order.city}, {tilda_site.money(order.amount)} {tilda_site.currency_sign(order.currency)}",
                 ", ".join(order.items[:2])[:80],
                 "",
                 "Сменить статус на «В обработке» и отправить письмо покупателю?",
-                f"Текст письма: «{NEW_ORDER_TEXT}»",
+                f"Текст письма: «{new_text}»",
             ]
-            pending[num] = {"ts": now_iso(), "action": "new_order", "text": NEW_ORDER_TEXT, "carrier": ""}
+            pending[num] = {"ts": now_iso(), "action": "new_order", "text": new_text, "carrier": ""}
             entry = offers.setdefault(num, {"ts": now_iso()})
             entry["ts"] = now_iso()
             entry.setdefault("actions", []).append("new_order")
@@ -1410,10 +1432,10 @@ async def check_tilda_shipping_sync(application: Application) -> None:
         if action == "pickup":
             if shipment.provider == "cdek":
                 track = shipment.shipment_id or str((shipment.extra or {}).get("im_number") or "") or order.tracking_number
-                text = PICKUP_TEXT_CDEK.format(track=track)
+                text = get_tilda_text(state, "pickup_cdek").replace("{track}", track)
                 carrier = "СДЭК"
             else:
-                text = PICKUP_TEXT_YANDEX
+                text = get_tilda_text(state, "pickup_yandex")
                 carrier = "Яндекс"
             lines = [
                 "📦 Заказ Тильды пришёл в ПВЗ",
@@ -1427,25 +1449,27 @@ async def check_tilda_shipping_sync(application: Application) -> None:
         elif action == "expiring":
             carrier = "СДЭК" if shipment.provider == "cdek" else "Яндекс"
             hours_left = max(0, int((exp_dt - now).total_seconds() // 3600))
+            exp_text = get_tilda_text(state, "expiring")
             lines = [
                 "⏰ Истекает срок хранения заказа Тильды в ПВЗ",
                 f"№ {num} — {order.customer}, {order.city}",
                 f"Служба: {carrier}, хранение до {fmt_date(shipment.storage_expires_at)} (осталось ~{hours_left} ч)",
                 "",
                 "Отправить покупателю письмо о срочном получении?",
-                f"Текст письма: «{STORAGE_EXPIRING_TEXT}»",
+                f"Текст письма: «{exp_text}»",
             ]
-            pending[num] = {"ts": now_iso(), "action": "expiring", "text": STORAGE_EXPIRING_TEXT, "carrier": carrier}
+            pending[num] = {"ts": now_iso(), "action": "expiring", "text": exp_text, "carrier": carrier}
         else:  # done
+            done_text = get_tilda_text(state, "done")
             lines = [
                 "📬 Заказ Тильды доставлен",
                 f"№ {num} — {order.customer}, {order.city}",
                 f"Служба: {'СДЭК' if shipment.provider == 'cdek' else 'Яндекс'}, статус «{shipment.status}»",
                 "",
                 "Сменить статус на «Завершён»? Отправить информацию о курсах письмом?",
-                f"Текст: «{DONE_COURSES_TEXT}»",
+                f"Текст: «{done_text}»",
             ]
-            pending[num] = {"ts": now_iso(), "action": "done", "text": DONE_COURSES_TEXT, "carrier": "СДЭК" if shipment.provider == "cdek" else "Яндекс"}
+            pending[num] = {"ts": now_iso(), "action": "done", "text": done_text, "carrier": "СДЭК" if shipment.provider == "cdek" else "Яндекс"}
         entry = offers.setdefault(num, {"ts": now_iso()})
         entry["ts"] = now_iso()
         entry.setdefault("actions", []).append(action)
@@ -1476,17 +1500,18 @@ async def apply_tilda_action(application: Application, order_number: str, action
             text = meta.get("text")
             if not text:
                 # Меты нет (например, предложение удалено): восстанавливаем текст по службе.
+                state_txt = await load_state()
                 detail = await tilda_client.fetch_order_detail(order_number)
                 carrier = "cdek" if (detail and detail.delivery and "СДЭК" in detail.delivery) else "yandex"
                 if carrier == "cdek":
                     track = (detail.tracking_number if detail else "") or order_number
-                    text = PICKUP_TEXT_CDEK.format(track=track)
+                    text = get_tilda_text(state_txt, "pickup_cdek").replace("{track}", track)
                 else:
-                    text = PICKUP_TEXT_YANDEX
+                    text = get_tilda_text(state_txt, "pickup_yandex")
             await tilda_client.set_public_comment(order_number, text)
             results.append("письмо отправлено")
         elif action == "expiring":
-            text = meta.get("text") or STORAGE_EXPIRING_TEXT
+            text = meta.get("text") or get_tilda_text(state, "expiring")
             await tilda_client.set_public_comment(order_number, text)
             results.append("письмо о сроке хранения отправлено")
         elif action == "new_order":
@@ -1498,7 +1523,7 @@ async def apply_tilda_action(application: Application, order_number: str, action
                     results.append("статус уже «В обработке»")
                 else:
                     raise
-            text = meta.get("text") or NEW_ORDER_TEXT
+            text = meta.get("text") or get_tilda_text(state, "new_order")
             await tilda_client.set_public_comment(order_number, text)
             results.append("письмо отправлено")
         else:  # done
@@ -1511,7 +1536,7 @@ async def apply_tilda_action(application: Application, order_number: str, action
                 else:
                     raise
             if with_courses:
-                await tilda_client.set_public_comment(order_number, DONE_COURSES_TEXT)
+                await tilda_client.set_public_comment(order_number, meta.get("text") or get_tilda_text(state, "done"))
                 results.append("письмо о курсах отправлено")
     except TildaError as e:
         logger.warning("Tilda action failed: %s", e)
@@ -2097,6 +2122,7 @@ def settings_main_kb(state: Dict[str, Any]) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(f"🛒 Заказы: {orders} дн", callback_data="set_page:orders")],
             [InlineKeyboardButton(f"📦 Остатки: {stock} шт", callback_data="set_page:stock")],
             [InlineKeyboardButton(f"⏰ Хранение: {warn} ч", callback_data="set_page:storage")],
+            [InlineKeyboardButton("✉️ Тексты писем покупателям", callback_data="set_page:texts")],
             [InlineKeyboardButton((("🟢 ⏸ Выключить мониторинг остатков" if stock_mon else "🔴 ▶️ Включить мониторинг остатков")), callback_data="stockmonitor_toggle")],
             [InlineKeyboardButton((("🟢 ⏸ Ozon мониторинг" if store_ozon_mon else "🔴 ▶️ Ozon мониторинг")), callback_data="storemonitor_ozon")],
             [InlineKeyboardButton((("🟢 ⏸ ЯМ мониторинг" if store_ym_mon else "🔴 ▶️ ЯМ мониторинг")), callback_data="storemonitor_ym")],
@@ -2126,6 +2152,16 @@ def settings_page_kb(page: str, state: Dict[str, Any]) -> InlineKeyboardMarkup:
     elif page == "storage":
         title, values = "Предупреждать о сроке хранения", [6, 12, 24, 48, 72]
         cb, cur = "setwarn", state.get("delivery_warn_hours", DELIVERY_STORAGE_WARN_HOURS)
+    elif page == "texts":
+        overrides = state.get("tilda_texts") or {}
+        rows = []
+        for key, ttl in TILDA_TEXT_TITLES.items():
+            row = [InlineKeyboardButton(f"✏️ {ttl}", callback_data=f"tedit:{key}")]
+            if key in overrides:
+                row.append(InlineKeyboardButton("↩️ Сброс", callback_data=f"ttext_reset:{key}"))
+            rows.append(row)
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings_back")])
+        return InlineKeyboardMarkup(rows)
     else:
         return settings_main_kb(state)
     rows = []
@@ -2171,6 +2207,16 @@ def settings_page_text(page: str, state: Dict[str, Any]) -> str:
             "Бот пришлёт сообщение, когда посылка в ПВЗ и срок хранения подходит к концу. "
             "Выберите, за сколько часов предупреждать:"
         )
+    if page == "texts":
+        overrides = state.get("tilda_texts") or {}
+        lines = ["✉️ Тексты писем покупателям (Тильда)\n"]
+        for key, ttl in TILDA_TEXT_TITLES.items():
+            text = overrides.get(key) or TILDA_TEXT_DEFAULTS.get(key, "")
+            mark = "" if key in overrides else " (по умолчанию)"
+            lines.append(f"«{ttl}»{mark}:")
+            lines.append(f"{text[:120]}\n")
+        lines.append("Нажмите шаблон, чтобы задать свой текст. ↩️ Сброс возвращает стандартный.")
+        return "\n".join(lines)
     return (
         "⚙️ Настройки\n"
         f"Мониторинг: {mon}\n"
@@ -2300,6 +2346,46 @@ async def text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     text = (update.message.text or "").strip()
+    # Ожидание ввода текста письма (шаблон или правка конкретного предложения)
+    state_in = await load_state()
+    waiting = state_in.get("tilda_text_input")
+    if waiting and update.effective_user and update.effective_user.id in (state_in.get("admins") or []):
+        # Гасим запрос, если он старше 30 минут
+        stale = False
+        try:
+            stale = waiting.get("ts") and (datetime.now(timezone.utc) - parse_dt(waiting["ts"])) > timedelta(minutes=30)
+        except Exception:
+            stale = False
+        if stale:
+            state_in.pop("tilda_text_input", None)
+            await storage.save(state_in)
+        elif text.lower() in ("отмена", "cancel", "/cancel"):
+            state_in.pop("tilda_text_input", None)
+            await storage.save(state_in)
+            await update.message.reply_text("Отменено, текст не изменён.")
+            return
+        elif waiting.get("key"):
+            state_in.setdefault("tilda_texts", {})[waiting["key"]] = text
+            state_in.pop("tilda_text_input", None)
+            await storage.save(state_in)
+            await update.message.reply_text(f"✅ Текст «{TILDA_TEXT_TITLES.get(waiting['key'], waiting['key'])}» сохранён.")
+            return
+        elif waiting.get("order"):
+            num = waiting["order"]
+            pending = state_in.setdefault("tilda_shipping_pending", {})
+            if pending.get(num):
+                pending[num]["text"] = text
+            state_in.pop("tilda_text_input", None)
+            await storage.save(state_in)
+            if pending.get(num):
+                await update.message.reply_text(
+                    f"✏️ Текст для заказа № {num} обновлён:\n«{text}»\nПодтвердите отправку:",
+                    reply_markup=_order_action_kb(num, waiting.get("action") or pending[num].get("action") or "pickup", waiting.get("wc", False)),
+                )
+            else:
+                await update.message.reply_text("Предложение по заказу уже неактуально, текст не сохранён.")
+            return
+
     mapping = {
         "🔄 Синхронизировать": "sync",
         "✅ Проверить": "check",
@@ -2533,9 +2619,45 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Отменено")
             await _show_inline_message(query.message, f"👌 Заказ № {order_number}: действие отменено.", inline_main_kb(), edit=True)
             return
+        if answer == "edit":
+            state["tilda_text_input"] = {"order": order_number, "action": action, "wc": with_courses, "ts": now_iso()}
+            await storage.save(state)
+            await query.answer("Пришлите новый текст одним сообщением", show_alert=False)
+            await query.message.reply_text(
+                f"✏️ Пришлите новый текст письма для заказа № {order_number} одним сообщением.\n"
+                "Отправьте «отмена», чтобы выйти без изменений."
+            )
+            return
         await query.answer("Выполняю…")
         result = await apply_tilda_action(context.application, order_number, action, with_courses)
         await _show_inline_message(query.message, result, inline_main_kb(), edit=True)
+        return
+    if data.startswith("tedit:"):
+        key = data.split(":", 1)[1]
+        if key not in TILDA_TEXT_DEFAULTS:
+            return
+        state = await load_state()
+        if query.from_user.id not in state.get("admins", []):
+            return
+        state["tilda_text_input"] = {"key": key, "ts": now_iso()}
+        await storage.save(state)
+        ttl = TILDA_TEXT_TITLES.get(key, key)
+        hint = " Можно использовать {track} — подставится трек-номер." if key == "pickup_cdek" else ""
+        await query.message.reply_text(
+            f"✏️ Пришлите новый текст письма «{ttl}» одним сообщением.{hint}\n"
+            "Отправьте «отмена», чтобы выйти без изменений."
+        )
+        return
+    if data.startswith("ttext_reset:"):
+        key = data.split(":", 1)[1]
+        state = await load_state()
+        if query.from_user.id not in state.get("admins", []):
+            return
+        (state.get("tilda_texts") or {}).pop(key, None)
+        state["tilda_texts"] = state.get("tilda_texts") or {}
+        state["tilda_texts"].pop(key, None)
+        await storage.save(state)
+        await show_settings_page(query.message, "texts", edit=True)
         return
     if data == "settings":
         await show_settings_page(query.message, "main", edit=True)
