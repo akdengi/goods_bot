@@ -268,6 +268,7 @@ class FakeApp:
 def fake_update(client: MaxClient, chat_id: int, text: str = "", mid: Optional[str] = None) -> SimpleNamespace:
     return SimpleNamespace(
         effective_chat=SimpleNamespace(id=int(chat_id)),
+        effective_user=SimpleNamespace(id=int(chat_id)),
         message=MaxMessage(client, chat_id, mid),
     )
 
@@ -463,6 +464,17 @@ async def handle_message_created(client: MaxClient, app: FakeApp, update: dict) 
             return
 
     if text:
+        # Пока бот ждёт ввод текста письма — текст уходит в text_menu, а не в меню.
+        try:
+            waiting = (await bot.load_state()).get("tilda_text_input")
+        except Exception:
+            waiting = None
+        if waiting:
+            try:
+                await bot.text_menu(fake_update(client, chat_id, text, mid), fake_context(app))
+            except Exception:
+                logger.exception("MAX text input failed")
+            return
         await bot.show_main_menu(MaxMessage(client, chat_id, mid))
 
 
