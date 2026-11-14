@@ -2363,6 +2363,7 @@ async def text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             state_in.pop("tilda_text_input", None)
             await storage.save(state_in)
             await update.message.reply_text(f"✅ Текст «{TILDA_TEXT_TITLES.get(waiting['key'], waiting['key'])}» сохранён.")
+            await show_settings_page(update.message, "texts")
             return
         elif waiting.get("order"):
             num = waiting["order"]
