@@ -2153,12 +2153,7 @@ def settings_page_kb(page: str, state: Dict[str, Any]) -> InlineKeyboardMarkup:
         title, values = "Предупреждать о сроке хранения", [6, 12, 24, 48, 72]
         cb, cur = "setwarn", state.get("delivery_warn_hours", DELIVERY_STORAGE_WARN_HOURS)
     elif page == "texts":
-        overrides = state.get("tilda_texts") or {}
-        rows = []
-        for key, ttl in TILDA_TEXT_TITLES.items():
-            row = [InlineKeyboardButton(f"✏️ {ttl}", callback_data=f"tedit:{key}"),
-                   InlineKeyboardButton("↩️", callback_data=f"ttext_reset:{key}")]
-            rows.append(row)
+        rows = [[InlineKeyboardButton(f"✏️ {ttl}", callback_data=f"tedit:{key}")] for key, ttl in TILDA_TEXT_TITLES.items()]
         rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings_back")])
         return InlineKeyboardMarkup(rows)
     else:
@@ -2646,10 +2641,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         ttl = TILDA_TEXT_TITLES.get(key, key)
         cur = get_tilda_text(state, key)
         hint = "\nМожно использовать {track} — подставится трек-номер." if key == "pickup_cdek" else ""
-        rows = []
-        if key in (state.get("tilda_texts") or {}):
-            rows.append([InlineKeyboardButton("↩️ Сбросить к стандартному", callback_data=f"ttext_reset:{key}")])
-        rows.append([InlineKeyboardButton("❌ Отмена", callback_data="ttext_cancel")])
+        rows = [[
+            InlineKeyboardButton("↩️ Сброс", callback_data=f"ttext_reset:{key}"),
+            InlineKeyboardButton("❌ Отмена", callback_data="ttext_cancel"),
+        ]]
         await query.message.reply_text(
             f"✏️ Текст письма «{ttl}»\n\nТекущий текст:\n«{cur}»\n\nПришлите новый текст одним сообщением.{hint}",
             reply_markup=InlineKeyboardMarkup(rows),
@@ -2659,9 +2654,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         state = await load_state()
         if query.from_user.id not in state.get("admins", []):
             return
-        state.pop("tilda_text_input", None)
+        waiting = state.pop("tilda_text_input", None) or {}
         await storage.save(state)
-        await query.message.reply_text("Отменено, текст не изменён.")
+        if waiting.get("key"):
+            await query.answer("Отменено")
+            await show_settings_page(query.message, "texts", edit=True)
+        else:
+            await query.message.reply_text("Отменено, текст не изменён.")
         return
     if data.startswith("ttext_reset:"):
         key = data.split(":", 1)[1]
@@ -2671,7 +2670,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         state.pop("tilda_text_input", None)
         state.setdefault("tilda_texts", {}).pop(key, None)
         await storage.save(state)
-        await query.message.reply_text(f"↩️ Текст «{TILDA_TEXT_TITLES.get(key, key)}» сброшен к стандартному.")
+        await query.answer("Сброшено к стандартному")
+        await show_settings_page(query.message, "texts", edit=True)
         return
     if data == "settings":
         await show_settings_page(query.message, "main", edit=True)
