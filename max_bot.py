@@ -219,11 +219,12 @@ def contact_kb() -> List[dict]:
 class MaxMessage:
     """Эмуляция telegram.Message: reply_text / edit_text + .chat.id."""
 
-    def __init__(self, client: MaxClient, chat_id: int, mid: Optional[str] = None, fmt: Optional[str] = None):
+    def __init__(self, client: MaxClient, chat_id: int, mid: Optional[str] = None, fmt: Optional[str] = None, text: str = ""):
         self._client = client
         self.chat = SimpleNamespace(id=chat_id)
         self._mid = mid
         self._fmt = fmt
+        self.text = text
 
     @property
     def mid(self) -> Optional[str]:
@@ -269,7 +270,7 @@ def fake_update(client: MaxClient, chat_id: int, text: str = "", mid: Optional[s
     return SimpleNamespace(
         effective_chat=SimpleNamespace(id=int(chat_id)),
         effective_user=SimpleNamespace(id=int(chat_id)),
-        message=MaxMessage(client, chat_id, mid),
+        message=MaxMessage(client, chat_id, mid, text=text),
     )
 
 
